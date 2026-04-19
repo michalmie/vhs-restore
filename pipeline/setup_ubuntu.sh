@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # VHS Pipeline Setup — Ubuntu 22.04 LTS
 # Supports: NVIDIA GPU, CUDA 11.x / 12.x, Python 3.12
-# Usage:    bash setup_ubuntu.sh
-# Safe to re-run — skips already-completed steps
+# Usage:    bash setup_ubuntu.sh           # install / resume
+#           bash setup_ubuntu.sh --clean   # wipe all installed components and re-install
 
 set -euo pipefail
 
@@ -20,6 +20,23 @@ ok()   { echo -e "${GREEN}  ✓ $*${NC}"; }
 warn() { echo -e "${YELLOW}  ! $*${NC}"; }
 fail() { echo -e "${RED}  ✗ $*${NC}"; exit 1; }
 step() { echo -e "\n${GREEN}[$1/8] $2${NC}"; }
+
+# ── --clean: wipe everything this script installed ────────────────────────────
+if [ "${1:-}" = "--clean" ]; then
+    echo -e "${YELLOW}Cleaning all installed components...${NC}"
+    rm -rf "$VENV"
+    rm -rf "$VS_PLUGIN_DIR"
+    rm -rf "$REALESRGAN_DIR"
+    rm -rf "$VS_SRC" /tmp/vs-plugin-* /tmp/havsfunc /tmp/knlmeanscl.7z
+    sudo rm -f /usr/local/lib/x86_64-linux-gnu/libvapoursynth.so* \
+               /usr/local/lib/x86_64-linux-gnu/pkgconfig/vapoursynth*.pc \
+               /usr/local/bin/vspipe \
+               /etc/ld.so.conf.d/vapoursynth.conf
+    sudo rm -rf /usr/local/include/vapoursynth
+    sudo ldconfig
+    echo -e "${GREEN}Clean done. Re-run without --clean to install fresh.${NC}"
+    exit 0
+fi
 
 
 # ── 1. System packages + Python 3.12 ─────────────────────────────────────────
