@@ -1,0 +1,39 @@
+# Python dependencies for VHS restoration pipeline
+# Install: pip install -r requirements.txt
+
+# Quality gate metrics (BRISQUE, NIQE)
+piq>=0.8.0
+
+# Required by piq
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ── External dependencies (NOT pip-installable) ─────────────────────────────
+#
+# 1. VapourSynth
+#    https://github.com/vapoursynth/vapoursynth
+#    Windows: download installer from releases
+#    Linux:   pip install vapoursynth (if available) or build from source
+#
+# 2. VapourSynth plugins (install via vsrepo or manually):
+#    - havsfunc          https://github.com/HomeOfVapourSynthEvolution/havsfunc
+#    - QTGMC             bundled with havsfunc
+#    - KNLMeansCL        https://github.com/Khanattila/KNLMeansCL
+#    - ffms2             https://github.com/FFMS/ffms2
+#
+#    vsrepo install:
+#      vsrepo.py install havsfunc
+#      vsrepo.py install knlmeanscl
+#      vsrepo.py install ffms2
+#
+# 3. Real-ESRGAN
+#    git clone https://github.com/xinntao/Real-ESRGAN ~/Real-ESRGAN
+#    cd ~/Real-ESRGAN && pip install -r requirements.txt
+#    python setup.py develop
+#
+# 4. ffmpeg (system binary, must include libvmaf for Gate 3)
+#    Windows: https://www.gyan.dev/ffmpeg/builds/  (full build includes libvmaf)
+#    Linux:   sudo apt install ffmpeg
+#    macOS:   brew install ffmpeg
+#
+#    Verify libvmaf: ffmpeg -filters | grep vmaf
