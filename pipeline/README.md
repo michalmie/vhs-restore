@@ -36,66 +36,97 @@ Input (MKV / MP4)
 
 ---
 
-## 1. Installation (Ubuntu 22.04)
+## 1. Installation (Ubuntu 22.04 — fresh VM)
 
-### 1.1 Run the setup script
+### 1.1 Install GitHub CLI and authenticate
 
 ```bash
-git clone <this-repo>
-cd vhs/pipeline
-bash setup_ubuntu.sh
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] \
+  https://cli.github.com/packages stable main" \
+  | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+sudo apt update && sudo apt install -y gh
+gh auth login
 ```
 
-The script installs everything in order and stops with a clear message if a step fails.
-If the NVIDIA driver is not yet installed it will install it and ask you to reboot — run the script again after rebooting.
+When prompted: choose **GitHub.com → HTTPS → Login with a web browser**, paste the one-time code shown.
 
-### 1.2 What the setup script installs
-
-| Step | What | Notes |
-|------|------|-------|
-| 1 | System packages | build tools, ffmpeg, Python 3.10, OpenCL headers |
-| 2 | NVIDIA driver + CUDA 12 | RTX 3060 Ti needs driver ≥ 525 |
-| 3 | ffmpeg with libvmaf | downloads a static build if the apt version lacks libvmaf |
-| 4 | Python venv | created at `~/vhs-env` |
-| 5 | VapourSynth core | installed via pip into the venv |
-| 6 | VapourSynth plugins | havsfunc (QTGMC), KNLMeansCL, ffms2, MVTools via vsrepo |
-| 7 | Real-ESRGAN | cloned to `~/Real-ESRGAN`, model weights downloaded |
-| 8 | Pipeline Python deps | `piq` (BRISQUE/NIQE), `torch`, `torchvision` with CUDA 12.1 |
-
-### 1.3 Verify the installation
+### 1.2 Clone the repository
 
 ```bash
-source ~/vhs-env/bin/activate
+gh repo clone michalmie/vhs-restore
+cd vhs-restore
+```
+
+### 1.3 Run the setup script
+
+```bash
+bash pipeline/setup_ubuntu.sh
+```
+
+The script installs everything in order and skips steps that are already complete — safe to re-run.
+
+> **NVIDIA driver not installed?** The script detects this, installs driver 535, and exits with a reboot prompt. After rebooting, re-run the same command.
+
+### 1.4 Verify the installation
+
+```bash
 bash pipeline/verify.sh
 ```
 
 Expected output:
+
 ```
-GPU       ✓ NVIDIA GeForce RTX 3060 Ti, driver 535.x, 8192 MiB
-ffmpeg    ✓ ffmpeg with libvmaf: present
-vspipe    ✓ VapourSynth rXX
-Python    ✓ 3.10.x  venv: active
+GPU         ✓ NVIDIA GeForce RTX 3060 Ti, driver 535.x, 8192 MiB
+ffmpeg      ✓ ffmpeg with libvmaf: present
+vspipe      ✓ VapourSynth rXX
+Python      ✓ 3.12.x  venv: active
 VapourSynth ✓ vapoursynth rXX
-          ✓ ffms2: loaded
-          ✓ knlmeanscl: loaded
-          ✓ mvtools: loaded
-          ✓ havsfunc (QTGMC): imported
-PyTorch   ✓ 2.x.x  CUDA: NVIDIA GeForce RTX 3060 Ti (8 GB)
-          ✓ piq (BRISQUE/NIQE): imported
+            ✓ ffms2: loaded
+            ✓ knlmeanscl: loaded
+            ✓ mvtools: loaded
+            ✓ havsfunc (QTGMC): imported
+PyTorch     ✓ 2.x.x  CUDA: NVIDIA GeForce RTX 3060 Ti (8 GB)
+            ✓ piq (BRISQUE/NIQE): imported
 Real-ESRGAN ✓ inference_realesrgan.py found
-          ✓ Model: realesr-general-x4v3.pth
-Pipeline  ✓ restore.py --help: OK
+            ✓ Model: realesr-general-x4v3.pth
+Pipeline    ✓ restore.py --help: OK
 ```
 
-### 1.4 Manual dependency notes
+### 1.5 Clean reset (if something went wrong)
 
-If vsrepo fails to install a plugin during setup, download the `.so` binary manually and place it in `~/.local/lib/vapoursynth/`:
+If a previous setup attempt left the system in a bad state, wipe everything and start fresh:
 
-| Plugin | Manual download |
-|--------|----------------|
-| KNLMeansCL | https://github.com/Khanattila/KNLMeansCL/releases |
-| MVTools | https://github.com/dubhater/vapoursynth-mvtools/releases |
-| ffms2 | https://github.com/FFMS/ffms2/releases |
+```bash
+bash pipeline/setup_ubuntu.sh --clean
+bash pipeline/setup_ubuntu.sh
+```
+
+This removes the venv, VapourSynth, all plugins, and Real-ESRGAN, then reinstalls from scratch. No manual commands needed.
+
+### 1.6 What the setup script installs
+
+| Step | What | Notes |
+|------|------|-------|
+| 1 | System packages | build tools, ffmpeg, Python 3.12, OpenCL, FFTW3, Boost |
+| 2 | NVIDIA driver + CUDA | RTX 3060 Ti needs driver ≥ 525 |
+| 3 | ffmpeg with libvmaf | uses jellyfin-ffmpeg7 if system ffmpeg lacks libvmaf |
+| 4 | Python 3.12 venv | created at `~/vhs-env` |
+| 5 | VapourSynth core | built from source (R74+, requires Python ≥ 3.12) |
+| 6 | VapourSynth plugins | havsfunc (QTGMC), ffms2, MVTools, KNLMeansCL — built from source |
+| 7 | PyTorch + Real-ESRGAN | cu118 for CUDA 11.x, cu121 for CUDA 12.x; model weights downloaded |
+| 8 | Pipeline Python deps | `piq` (BRISQUE/NIQE quality metrics) |
+
+### 1.7 Manual plugin notes
+
+If a plugin build fails, you can place the `.so` file manually in `~/.local/lib/vapoursynth/`:
+
+| Plugin | Source |
+|--------|--------|
+| KNLMeansCL | https://github.com/Khanattila/KNLMeansCL |
+| MVTools | https://github.com/dubhater/vapoursynth-mvtools |
+| ffms2 | system: `/usr/lib/x86_64-linux-gnu/libffms2.so` |
 
 ```bash
 mkdir -p ~/.local/lib/vapoursynth
@@ -106,7 +137,7 @@ cp downloaded_plugin.so ~/.local/lib/vapoursynth/
 
 ## 2. Trim trailing blank screen (optional pre-step)
 
-VHS recordings often end with a blank screen when the recorder stops. Trim this before restoring — it is faster and cheaper to trim the raw capture.
+VHS recordings often end with a blank screen when the recorder stops. Trim before restoring — it is faster and cheaper to trim the raw capture.
 
 ```bash
 source ~/vhs-env/bin/activate
@@ -300,7 +331,7 @@ Example report:
 {
   "input": "/home/user/captured.mkv",
   "output": "/home/user/output.mkv",
-  "config": { "qtgmc_preset": "Slower", "knlm_h": 1.2, ... },
+  "config": { "qtgmc_preset": "Slower", "knlm_h": 1.2, "..." : "..." },
   "gates": [
     {
       "gate": "deinterlace",
@@ -448,7 +479,9 @@ python pipeline/restore.py captured.mkv output.mkv \
 pipeline/
 ├── restore.py        Main pipeline script
 ├── trim.py           Trailing blank-screen removal
-├── setup_ubuntu.sh   Full dependency installer for Ubuntu 22.04
+├── setup_ubuntu.sh   Full dependency installer (Ubuntu 22.04)
+│                       bash setup_ubuntu.sh           # install / resume
+│                       bash setup_ubuntu.sh --clean   # wipe and reinstall
 ├── verify.sh         Post-install verification
 ├── requirements.txt  pip dependencies + notes on external tools
 └── README.md         This file
