@@ -117,6 +117,24 @@ class Config:
     # Source format
     skip_deinterlace: bool = False  # set True if source is already progressive (e.g. OBS MP4)
 
+    # ── Opt-in effects ────────────────────────────────────────────────────────
+    stabilize: bool = False          # video stabilization (requires libvidstab in ffmpeg)
+    repair_dropouts: bool = False    # VHS dropout / line artifact repair (median filter)
+    balance_brightness: bool = False # auto-normalize brightness/contrast
+    sharpen: bool = False            # unsharp mask after upscaling
+    fix_ar: bool = False             # correct aspect ratio (e.g. anamorphic → square pixels)
+    audio_cleanup: bool = False      # spectral noise reduction on audio track
+
+    # ── Opt-out effects ───────────────────────────────────────────────────────
+    skip_denoise: bool = False       # disable KNLMeansCL / hqdn3d
+    skip_color: bool = False         # disable VHS levels correction (16-235)
+
+    # ── Effect tuning ─────────────────────────────────────────────────────────
+    sharpen_amount: float = 1.5      # unsharp luma amount (0.5–3.0)
+    saturation: float = 1.0          # color saturation multiplier (1.0 = no change)
+    ar_target: str = "4:3"           # target display aspect ratio for --fix-ar
+    audio_cleanup_db: float = 10.0   # afftdn noise reduction dB (5=gentle, 20=strong)
+
     # Test mode
     test_mode: bool = False
     test_start: str = "00:05:00"
@@ -363,6 +381,86 @@ def _output_res_filter(cfg: Config) -> str | None:
     return None
 
 
+# ── Effect filter builders ────────────────────────────────────────────────────
+
+def _pre_upscale_filters(cfg: Config) -> list[str]:
+    """ffmpeg video filters applied before upscaling (Stage 1 output)."""
+    f = []
+    if cfg.repair_dropouts:
+        # Temporal median blend reduces VHS horizontal-line dropout artifacts
+        f.append("tblend=all_mode=median")
+        f.append("hqdn3d=0:0:3:3")   # temporal-only pass to smooth blended frames
+    if cfg.balance_brightness:
+        # Stretch histogram to use full range; preserve relative tone
+        f.append("normalize=blackpt=black:whitept=white:smoothing=5")
+    if cfg.saturation != 1.0:
+        f.append(f"eq=saturation={cfg.saturation:.2f}")
+    return f
+
+
+def _post_upscale_filters(cfg: Config) -> list[str]:
+    """ffmpeg video filters applied after upscaling, before final encode."""
+    f = []
+    if cfg.fix_ar:
+        # Map common named ratios to SAR values; Real-ESRGAN outputs square pixels so we
+        # just set the display AR via setdar without scaling (no quality loss).
+        f.append(f"setdar={cfg.ar_target.replace(':', '/')}")
+    if cfg.sharpen:
+        amt = cfg.sharpen_amount
+        f.append(f"unsharp=lx=5:ly=5:la={amt:.1f}:cx=3:cy=3:ca=0.0")
+    return f
+
+
+def _audio_filters(cfg: Config) -> list[str]:
+    """ffmpeg audio filters for Stage 3."""
+    if cfg.audio_cleanup:
+        return [f"afftdn=nf=-{cfg.audio_cleanup_db:.0f}"]
+    return []
+
+
+# ── Stabilization (pre-Stage 1, optional 2-pass) ─────────────────────────────
+
+def stage_stabilize(input_path: Path, output_path: Path, work_dir: Path,
+                    on_progress: Callable[[str, int, int], None] | None = None) -> None:
+    """2-pass video stabilization via libvidstab (ffmpeg must be compiled with it)."""
+    # Check availability
+    probe = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True)
+    if "vidstabdetect" not in probe.stdout:
+        LOG.warning(
+            "libvidstab not available in this ffmpeg build — skipping stabilization.\n"
+            "  Install: sudo apt install ffmpeg  (system ffmpeg has libvidstab)\n"
+            "  Or compile jellyfin-ffmpeg with --enable-libvidstab"
+        )
+        import shutil as _sh
+        _sh.copy2(input_path, output_path)
+        return
+
+    trf = work_dir / "stabilize.trf"
+    total = _probe_frame_count(input_path)
+
+    LOG.info("  Stabilize pass 1/2: motion analysis...")
+    _run_tracking(
+        ["ffmpeg", "-y", "-i", str(input_path),
+         "-vf", f"vidstabdetect=shakiness=5:accuracy=15:result={trf}",
+         "-f", "null", "-"],
+        on_stderr=lambda l: (
+            on_progress("stabilize", int(m.group(1)), total)
+            if (m := re.search(r"frame=\s*(\d+)", l)) and on_progress else None
+        ),
+    )
+
+    LOG.info("  Stabilize pass 2/2: applying transform...")
+    _run_tracking(
+        ["ffmpeg", "-y", "-i", str(input_path),
+         "-vf", f"vidstabtransform=input={trf}:zoom=5:smoothing=30,unsharp=5:5:0.8:3:3:0.4",
+         "-c:a", "copy", str(output_path)],
+        on_stderr=lambda l: (
+            on_progress("stabilize", int(m.group(1)), total)
+            if (m := re.search(r"frame=\s*(\d+)", l)) and on_progress else None
+        ),
+    )
+
+
 # ── Stage 1: VapourSynth (deinterlace + denoise + color) ─────────────────────
 
 def detect_field_order(path: Path) -> str:
@@ -403,18 +501,23 @@ def _stage_vs_ffmpeg(
         "Run bash pipeline/setup_ubuntu.sh to install full plugin stack."
     )
 
-    # Map knlm_h (0.8–2.0) to hqdn3d luma_spatial (2–6)
-    luma = max(1.0, cfg.knlm_h * 3.0)
-    filters = [f"hqdn3d={luma:.1f}:{luma*0.75:.1f}:{luma*1.5:.1f}:{luma:.1f}"]
+    filters = []
 
-    lo = cfg.levels_min_in / 255.0
-    hi = cfg.levels_max_in / 255.0
-    if lo > 0.001 or hi < 0.999:
-        filters.append(
-            f"colorlevels=rimin={lo:.4f}:rimax={hi:.4f}"
-            f":gimin={lo:.4f}:gimax={hi:.4f}"
-            f":bimin={lo:.4f}:bimax={hi:.4f}"
-        )
+    if not cfg.skip_denoise:
+        luma = max(1.0, cfg.knlm_h * 3.0)
+        filters.append(f"hqdn3d={luma:.1f}:{luma*0.75:.1f}:{luma*1.5:.1f}:{luma:.1f}")
+
+    if not cfg.skip_color:
+        lo = cfg.levels_min_in / 255.0
+        hi = cfg.levels_max_in / 255.0
+        if lo > 0.001 or hi < 0.999:
+            filters.append(
+                f"colorlevels=rimin={lo:.4f}:rimax={hi:.4f}"
+                f":gimin={lo:.4f}:gimax={hi:.4f}"
+                f":bimin={lo:.4f}:bimax={hi:.4f}"
+            )
+
+    filters.extend(_pre_upscale_filters(cfg))
 
     total = _probe_frame_count(input_path)
     cmd = (
@@ -570,13 +673,15 @@ def stage_final(
 ) -> None:
     LOG.info("[Stage 3] Film grain (strength=%d) + final encode (%s)", cfg.grain_strength, cfg.output_codec)
 
-    filters = []
+    vfilters: list[str] = []
+    vfilters.extend(_post_upscale_filters(cfg))
     res_filter = _output_res_filter(cfg)
     if res_filter:
-        filters.append(res_filter)
+        vfilters.append(res_filter)
     if cfg.grain_strength > 0:
-        filters.append(f"noise=alls={cfg.grain_strength}:allf=t+u")
+        vfilters.append(f"noise=alls={cfg.grain_strength}:allf=t+u")
 
+    afilters = _audio_filters(cfg)
     audio_codec = "aac" if cfg.output_codec in ("h264", "h265") else "flac"
     total = _probe_frame_count(video)
 
@@ -584,7 +689,8 @@ def stage_final(
         ["ffmpeg", "-y",
          "-i", str(video), "-i", str(audio_source),
          "-map", "0:v", "-map", "1:a",
-         *(["-vf", ",".join(filters)] if filters else []),
+         *(["-vf", ",".join(vfilters)] if vfilters else []),
+         *(["-af", ",".join(afilters)] if afilters else []),
          *_video_flags(cfg), "-c:a", audio_codec,
          str(output_path)],
         on_stderr=lambda l: (
@@ -842,9 +948,19 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
         ui = PipelineUI(input_path, output_path, cfg)
 
         with ui:
+            # ── Stabilization (optional pre-stage) ──
+            if cfg.stabilize:
+                stab_out = work_dir / "s0_stabilized.mkv"
+                ui.start_stage(0, "Stabilization")
+                stage_stabilize(input_path, stab_out, work_dir, on_progress=ui.on_progress)
+                ui.finish_stage(0)
+                input_path = stab_out
+                audio_source = stab_out
+
             # ── Stage 1 ──
             vs_out = work_dir / "s1_vs.mkv"
-            ui.start_stage(1, "Deinterlace + Denoise")
+            label1 = "Deinterlace + Denoise" if not cfg.skip_denoise else "Color correction"
+            ui.start_stage(1, label1)
             stage_vs(input_path, vs_out, cfg, work_dir, on_progress=ui.on_progress)
             ui.finish_stage(1)
 
@@ -1174,14 +1290,70 @@ def cmd_analyze(args: argparse.Namespace) -> None:
                 tmp_frame.unlink(missing_ok=True)
         refresh(progress)
 
-    # ── Results ───────────────────────────────────────────────────────────────
-    knlm    = 0.8 if (noise_val or 0) < 20 else (2.0 if (noise_val or 0) >= 40 else 1.2)
-    skip_di = "--skip-deinterlace " if not interlaced else ""
-    suggested = (
-        f"python pipeline/restore.py restore {input_path.name} output.mkv \\\n"
-        f"  {skip_di}--knlm-h {knlm:.1f} --scale 2 --codec ffv1"
-    )
+    # ── Build recommendations ─────────────────────────────────────────────────
+    nv = noise_val or 0
+    knlm = 0.8 if nv < 20 else (2.0 if nv >= 40 else 1.2)
 
+    # Each effect: (flag, description, recommended_on, reason)
+    effects = [
+        ("--skip-deinterlace" if not interlaced else None,
+         "Deinterlacing",      interlaced,        "source is interlaced" if interlaced else "source is already progressive"),
+        (f"--knlm-h {knlm:.1f}",
+         "Noise reduction",    True,              f"BRISQUE {nv:.1f}" if noise_val else "default on"),
+        ("--repair-dropouts",
+         "Dropout/line repair", nv >= 30,         "high noise suggests tape dropout"),
+        (None,
+         "Color correction",   True,              "VHS 16–235 levels (always on)"),
+        ("--balance-brightness",
+         "Brightness balance",  nv >= 40,         "noisy sources often have exposure issues"),
+        ("--sharpen",
+         "Sharpness",          False,             "opt-in — adds crispness post-upscale"),
+        ("--scale 2",
+         "AI upscaling",       True,              "2× Real-ESRGAN (default)"),
+        ("--fix-ar",
+         "Aspect ratio fix",   False,             "opt-in — use if image looks squashed"),
+        ("--audio-cleanup",
+         "Audio cleanup",      False,             "opt-in — reduces background hiss/hum"),
+        ("--stabilize",
+         "Stabilization",      False,             "opt-in — requires libvidstab in ffmpeg"),
+    ]
+
+    effects_table = Table(box=None, show_header=False, padding=(0, 1))
+    effects_table.add_column(width=3)
+    effects_table.add_column(width=22)
+    effects_table.add_column(width=20, style="dim cyan")
+    effects_table.add_column(style="dim")
+    for flag, name, on, reason in effects:
+        icon  = "[green]✓[/]" if on else "[dim]○[/]"
+        ftext = f"[cyan]{flag}[/]" if flag and on and flag != "--skip-deinterlace" else (
+                f"[dim]{flag}[/]" if flag else "")
+        effects_table.add_row(icon, name, ftext, reason)
+
+    # Build suggested full command
+    extra_flags = []
+    if not interlaced:
+        extra_flags.append("--skip-deinterlace")
+    extra_flags.append(f"--knlm-h {knlm:.1f}")
+    if nv >= 30:
+        extra_flags.append("--repair-dropouts")
+    if nv >= 40:
+        extra_flags.append("--balance-brightness")
+
+    base_cmd = f"python pipeline/restore.py restore {input_path.name}"
+    flags_str = " ".join(extra_flags)
+
+    test_30  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 30 {flags_str}"
+    test_60  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 60 {flags_str}"
+    full_cmd = f"{base_cmd} output.mkv {flags_str}"
+
+    test_table = Table(box=None, show_header=False, padding=(0, 1))
+    test_table.add_column(style="dim", width=12)
+    test_table.add_column(style="cyan")
+    test_table.add_row("30s preview",  test_30)
+    test_table.add_row("60s preview",  test_60)
+    test_table.add_row("Full restore", full_cmd)
+
+    # Properties table
     info = Table(box=None, show_header=False, padding=(0, 2))
     info.add_column(style="dim", width=14)
     info.add_column()
@@ -1200,12 +1372,10 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     _CONSOLE.print()
     _CONSOLE.print(Panel(info, title="[bold]Video Properties[/]", border_style="blue"))
-    _CONSOLE.print(Panel(profiles_table, title="[bold]Profiles[/]", border_style="dim"))
-    _CONSOLE.print(Panel(
-        f"[cyan]{suggested}[/]",
-        title="[bold]Suggested Command[/]",
-        border_style="dim",
-    ))
+    _CONSOLE.print(Panel(effects_table, title="[bold]Effects[/]  [dim](✓ recommended  ○ optional)[/]",
+                         border_style="blue"))
+    _CONSOLE.print(Panel(profiles_table, title="[bold]Output Profiles[/]", border_style="dim"))
+    _CONSOLE.print(Panel(test_table, title="[bold]Commands[/]", border_style="green"))
 
     if args.json:
         data = {
@@ -1216,7 +1386,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             "interlaced": interlaced,
             "field_order": field,
             "brisque": round(noise_val, 2) if noise_val is not None else None,
-            "suggested_command": suggested,
+            "recommended_flags": extra_flags,
+            "commands": {"test_30": test_30, "test_60": test_60, "full": full_cmd},
         }
         _CONSOLE.print_json(json.dumps(data))
 
@@ -1264,22 +1435,47 @@ def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Film grain synthesis strength (0 = off)")
     g.add_argument("--keep-intermediates", action="store_true")
 
-    g = p.add_argument_group("Deinterlacing")
-    g.add_argument("--qtgmc-preset", default="Slower",
-                   choices=["Draft", "Fast", "Medium", "Slow", "Slower", "Placebo"])
+    g = p.add_argument_group("Effects — on by default (use --skip-X to disable)")
     g.add_argument("--skip-deinterlace", action="store_true",
-                   help="Skip QTGMC — source is already progressive (e.g. OBS capture)")
+                   help="Skip QTGMC deinterlacing (source is already progressive)")
+    g.add_argument("--skip-denoise", action="store_true",
+                   help="Skip noise reduction")
+    g.add_argument("--skip-color", action="store_true",
+                   help="Skip VHS levels correction (16–235)")
+    g.add_argument("--qtgmc-preset", default="Slower",
+                   choices=["Draft", "Fast", "Medium", "Slow", "Slower", "Placebo"],
+                   help="QTGMC quality preset (slower = better)")
 
-    g = p.add_argument_group("Denoising")
+    g = p.add_argument_group("Effects — off by default (use flag to enable)")
+    g.add_argument("--stabilize", action="store_true",
+                   help="Video stabilization (requires libvidstab in ffmpeg)")
+    g.add_argument("--repair-dropouts", action="store_true", dest="repair_dropouts",
+                   help="VHS dropout / horizontal-line artifact repair")
+    g.add_argument("--balance-brightness", action="store_true", dest="balance_brightness",
+                   help="Auto-normalize brightness and contrast")
+    g.add_argument("--sharpen", action="store_true",
+                   help="Unsharp mask after upscaling")
+    g.add_argument("--fix-ar", action="store_true", dest="fix_ar",
+                   help="Correct display aspect ratio (anamorphic / square-pixel mismatch)")
+    g.add_argument("--audio-cleanup", action="store_true", dest="audio_cleanup",
+                   help="Spectral noise reduction on audio track")
+
+    g = p.add_argument_group("Effect tuning")
     g.add_argument("--knlm-h", type=float, default=1.2, metavar="STRENGTH",
                    help="Denoise strength: 0.8=light, 1.2=balanced, 2.0=aggressive")
     g.add_argument("--knlm-d", type=int, default=1,
                    help="Temporal radius in frames")
     g.add_argument("--gpu", type=int, default=0, dest="gpu_device_id")
-
-    g = p.add_argument_group("Color correction")
     g.add_argument("--levels-min-in", type=int, default=16, help="Black point (VHS default: 16)")
     g.add_argument("--levels-max-in", type=int, default=235, help="White point (VHS default: 235)")
+    g.add_argument("--saturation", type=float, default=1.0,
+                   help="Color saturation multiplier (1.0=unchanged, 1.3=boost)")
+    g.add_argument("--sharpen-amount", type=float, default=1.5, dest="sharpen_amount",
+                   help="Unsharp mask strength (0.5–3.0)")
+    g.add_argument("--ar-target", default="4:3", dest="ar_target",
+                   help="Display aspect ratio for --fix-ar (e.g. 4:3, 16:9)")
+    g.add_argument("--audio-cleanup-db", type=float, default=10.0, dest="audio_cleanup_db",
+                   help="Audio noise floor reduction in dB (5=gentle, 20=strong)")
 
     g = p.add_argument_group("Upscaling")
     g.add_argument("--scale", type=int, default=2, choices=[1, 2, 4],
