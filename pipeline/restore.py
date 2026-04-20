@@ -138,7 +138,7 @@ class Config:
     # Test mode
     test_mode: bool = False
     test_start: str = "00:05:00"
-    test_duration: int = 30
+    test_duration: int = 10
     test_sample: bool = False   # auto-pick start from middle of video
     compare: bool = False       # generate side-by-side comparison video
 
@@ -920,13 +920,18 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             _run_live([
                 "ffmpeg", "-y",
                 "-ss", test_start,
-                "-t", str(cfg.test_duration),
                 "-i", str(input_path),
+                "-t", str(cfg.test_duration),  # output option — exact duration limit
                 "-c", "copy",
                 str(clip),
             ])
             input_path = clip
             audio_source = clip
+
+        # Test mode: skip upscaling, output only the side-by-side comparison
+        if cfg.test_mode:
+            cfg.realesrgan_scale = 1
+            cfg.compare = True
 
         # Auto-detect field order if not explicitly set
         if not cfg.skip_deinterlace:
@@ -977,34 +982,47 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             ui.finish_gate(g2)
 
             # ── Stage 2 ──
-            upscaled_out = work_dir / "s2_upscaled.mkv"
-            ui.start_stage(2, "AI Upscaling (Real-ESRGAN)")
-            stage_upscale(vs_out, upscaled_out, cfg, work_dir, on_progress=ui.on_progress)
-            ui.finish_stage(2)
+            if cfg.realesrgan_scale == 1:
+                upscaled_out = vs_out  # skip Real-ESRGAN in test mode / scale=1
+            else:
+                upscaled_out = work_dir / "s2_upscaled.mkv"
+                ui.start_stage(2, "AI Upscaling (Real-ESRGAN)")
+                stage_upscale(vs_out, upscaled_out, cfg, work_dir, on_progress=ui.on_progress)
+                ui.finish_stage(2)
 
-            ui.start_gate("Gate 3", "Upscale quality")
-            g3 = gate_upscale(upscaled_out, vs_out, cfg, work_dir)
-            report["gates"].append(g3)
-            ui.finish_gate(g3)
+                ui.start_gate("Gate 3", "Upscale quality")
+                g3 = gate_upscale(upscaled_out, vs_out, cfg, work_dir)
+                report["gates"].append(g3)
+                ui.finish_gate(g3)
 
             # ── Stage 3 ──
+            # In test mode the comparison video IS the output; encode to a temp first
+            final_encode_path = (
+                work_dir / ("s3_final" + output_path.suffix)
+                if cfg.test_mode and cfg.compare
+                else output_path
+            )
             ui.start_stage(3, "Film Grain + Final Encode")
-            stage_final(upscaled_out, audio_source, output_path, cfg, on_progress=ui.on_progress)
+            stage_final(upscaled_out, audio_source, final_encode_path, cfg, on_progress=ui.on_progress)
             ui.finish_stage(3)
 
             ui.start_gate("Gate 4", "Final quality")
-            g4 = gate_final(output_path, cfg, work_dir)
+            g4 = gate_final(final_encode_path, cfg, work_dir)
             report["gates"].append(g4)
             ui.finish_gate(g4)
 
         # ── Comparison video ──
         compare_path: Path | None = None
         if cfg.compare:
-            compare_path = output_path.with_name(
-                output_path.stem + "_compare.mp4"
-            )
+            if cfg.test_mode:
+                # Comparison IS the output; write directly to output_path
+                compare_path = output_path
+            else:
+                compare_path = output_path.with_name(
+                    output_path.stem + "_compare.mp4"
+                )
             ui.start_stage(4, "Side-by-side comparison")
-            make_comparison(audio_source, output_path, compare_path,
+            make_comparison(audio_source, final_encode_path, compare_path,
                             on_progress=ui.on_progress)
             ui.finish_stage(4)
 
@@ -1013,10 +1031,13 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
         total  = sum(1 for g in report["gates"] if g.get("passed") is not None)
         report["summary"] = {"gates_passed": passed, "gates_total": total}
 
-        report_path = output_path.with_suffix("").with_suffix(".quality_report.json")
+        # In test mode the user-visible output is the comparison video
+        visible_output = compare_path if (cfg.test_mode and compare_path) else output_path
+        report_path = visible_output.with_suffix("").with_suffix(".quality_report.json")
         report_path.write_text(json.dumps(report, indent=2))
 
-        ui.show_summary(passed, total, output_path, report_path, compare_path)
+        ui.show_summary(passed, total, visible_output, report_path,
+                        None if cfg.test_mode else compare_path)
 
         return report
 
@@ -1407,15 +1428,15 @@ def cmd_analyze(args: argparse.Namespace) -> None:
 
     fstr = flags_str.strip()
     sep  = (" " + fstr) if fstr else ""
-    test_30  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 30 --compare{sep}"
-    test_60  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 60 --compare{sep}"
+    test_10  = f"{base_cmd} preview.mp4 --test --test-sample{sep}"
+    test_30  = f"{base_cmd} preview.mp4 --test --test-sample --test-duration 30{sep}"
     full_cmd = f"{base_cmd} output.mkv{sep}"
 
     test_table = Table(box=None, show_header=False, padding=(0, 1))
     test_table.add_column(style="dim", width=12)
     test_table.add_column(style="cyan")
+    test_table.add_row("10s preview",  test_10)
     test_table.add_row("30s preview",  test_30)
-    test_table.add_row("60s preview",  test_60)
     test_table.add_row("Full restore", full_cmd)
 
     # Properties table
@@ -1452,7 +1473,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             "field_order": field,
             "brisque": round(noise_val, 2) if noise_val is not None else None,
             "recommended_flags": extra_flags,
-            "commands": {"test_30": test_30, "test_60": test_60, "full": full_cmd},
+            "commands": {"test_10": test_10, "test_30": test_30, "full": full_cmd},
         }
         _CONSOLE.print_json(json.dumps(data))
 
@@ -1561,7 +1582,7 @@ def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Pick the sample clip from the middle of the video")
     g.add_argument("--test-start", default="00:05:00",
                    help="Sample start time HH:MM:SS (overridden by --test-sample)")
-    g.add_argument("--test-duration", type=int, default=30,
+    g.add_argument("--test-duration", type=int, default=10,
                    help="Sample length in seconds")
     g.add_argument("--compare", action="store_true",
                    help="Generate a side-by-side before/after comparison video alongside output")
@@ -1809,6 +1830,8 @@ def main() -> None:
         cmd_trim(args)
     elif args.subcommand == "restore":
         _check_env()
+        if getattr(args, "test_sample", False) and not getattr(args, "test_mode", False):
+            args.test_mode = True
         cmd_restore(args)
 
 
