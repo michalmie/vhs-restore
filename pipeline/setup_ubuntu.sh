@@ -195,17 +195,45 @@ else
         warn "havsfunc install failed — QTGMC unavailable"
 fi
 
-# ffms2 — system apt package (libffms2 2.40) already includes the VapourSynth plugin;
-# building from source fails because latest ffms2 requires ffmpeg ≥ 7.x
-if find "$VS_PLUGIN_DIR" -name "libffms2.so*" 2>/dev/null | grep -q .; then
+# ffms2 — requires ffmpeg ≥ 7.x; build from source against jellyfin-ffmpeg7
+# (system apt libffms2 is the C library only, not a VapourSynth plugin)
+rm -f "$VS_PLUGIN_DIR/libffms2.so"  # remove stale symlink from previous attempts
+if find "$VS_PLUGIN_DIR" -name "libffms2.so" 2>/dev/null | grep -qv "^$"; then
     ok "ffms2 (already installed)"
 else
-    FFMS2_SO=$(find /usr/lib -name "libffms2.so" 2>/dev/null | head -1)
-    if [ -n "$FFMS2_SO" ]; then
-        ln -sf "$FFMS2_SO" "$VS_PLUGIN_DIR/libffms2.so"
-        ok "ffms2 (system library → $FFMS2_SO)"
+    JFFMPEG="/usr/lib/jellyfin-ffmpeg"
+    FFMS2_SRC="/tmp/vs-plugin-ffms2"
+    echo "  Building ffms2 against jellyfin-ffmpeg7..."
+    rm -rf "$FFMS2_SRC"
+    if [ ! -d "$JFFMPEG" ]; then
+        warn "ffms2: jellyfin-ffmpeg7 not found at $JFFMPEG — video source unavailable"
+    elif ! git clone -q --depth=1 https://github.com/FFMS/ffms2 "$FFMS2_SRC"; then
+        warn "ffms2: git clone failed"
     else
-        warn "ffms2: system libffms2 not found — check libffms2-dev install"
+        cd "$FFMS2_SRC"
+        # Find jellyfin pkg-config dir (usually lib/pkgconfig inside the jellyfin prefix)
+        JFFMPEG_PKG=$(find "$JFFMPEG" -name "libavformat.pc" 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "")
+        if [ -n "$JFFMPEG_PKG" ]; then
+            export PKG_CONFIG_PATH="$JFFMPEG_PKG:$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        fi
+        ./autogen.sh 2>/dev/null
+        # Pass jellyfin include/lib paths explicitly so configure finds ffmpeg regardless of pkg-config
+        CPPFLAGS="-I${JFFMPEG}/include" \
+        LDFLAGS="-L${JFFMPEG}/lib -Wl,-rpath,${JFFMPEG}/lib" \
+        ./configure --prefix=/usr/local --with-vapoursynth 2>/dev/null
+        if make -j"$(nproc)" 2>/dev/null; then
+            # autotools puts the VS plugin .so in src/vapoursynth/.libs/
+            BUILT_SO=$(find . -name "libffms2.so" ! -name "*.la" 2>/dev/null | head -1)
+            if [ -n "$BUILT_SO" ]; then
+                cp "$BUILT_SO" "$VS_PLUGIN_DIR/libffms2.so"
+                ok "ffms2 (built against jellyfin-ffmpeg7)"
+            else
+                warn "ffms2: build succeeded but libffms2.so not found"
+            fi
+        else
+            warn "ffms2: make failed — video source unavailable"
+        fi
+        cd - > /dev/null
     fi
 fi
 
