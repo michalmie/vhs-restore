@@ -303,6 +303,13 @@ pip install -r requirements.txt
 python3 setup.py develop -q 2>/dev/null
 cd - > /dev/null
 
+# basicsr ships a broken import for torchvision >= 0.17 — patch it
+DEGRADATIONS="$VENV/lib/python3.12/site-packages/basicsr/data/degradations.py"
+if [ -f "$DEGRADATIONS" ] && grep -q "functional_tensor" "$DEGRADATIONS"; then
+    sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' "$DEGRADATIONS"
+    ok "basicsr degradations.py patched (functional_tensor → functional)"
+fi
+
 # Download model weights
 mkdir -p "$REALESRGAN_DIR/weights"
 declare -A MODELS=(
