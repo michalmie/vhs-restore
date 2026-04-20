@@ -790,15 +790,42 @@ _PROFILES: dict[str, dict] = {
 
 # ── Analyze command ───────────────────────────────────────────────────────────
 
+import time as _time
+
+
+class _Step:
+    """Print a step label, then overwrite with timing when done."""
+
+    _STEPS_TOTAL = 3
+
+    def __init__(self, n: int, label: str) -> None:
+        self._label = label
+        self._n = n
+        self._t0 = _time.perf_counter()
+        print(f"  [{n}/{self._STEPS_TOTAL}] {label}...", end="", flush=True)
+
+    def done(self, note: str = "") -> None:
+        elapsed = _time.perf_counter() - self._t0
+        suffix = f"  {note}" if note else ""
+        print(f"\r  [{self._n}/{self._STEPS_TOTAL}] {self._label}  {elapsed:.1f}s{suffix}")
+
+    def skip(self, reason: str) -> None:
+        print(f"\r  [{self._n}/{self._STEPS_TOTAL}] {self._label}  skipped ({reason})")
+
+
 def cmd_analyze(args: argparse.Namespace) -> None:
     input_path = args.input.resolve()
     if not input_path.exists():
         print(f"error: file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Analyzing {input_path.name}...")
+    t_start = _time.perf_counter()
+    print(f"Analyzing  {input_path.name}")
+    print()
 
-    # Probe video properties
+    # ── Step 1: probe video properties ────────────────────────────────────────
+    step = _Step(1, "Probing video properties")
+
     def probe(entries: str, stream: str = "v:0") -> str:
         r = subprocess.run([
             "ffprobe", "-v", "error",
@@ -810,7 +837,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         return r.stdout.strip()
 
     try:
-        w, h = probe("stream=width,height").split(",")
+        w, h  = probe("stream=width,height").split(",")
         fps   = probe("stream=r_frame_rate")
         codec = probe("stream=codec_name")
         field = probe("stream=field_order")
@@ -821,58 +848,81 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             str(input_path),
         ], capture_output=True, text=True).stdout.strip())
     except Exception as e:
-        print(f"error: could not probe video: {e}", file=sys.stderr)
+        print(f"\nerror: could not probe video: {e}", file=sys.stderr)
         sys.exit(1)
 
     mins, secs = divmod(int(dur), 60)
     hrs, mins  = divmod(mins, 60)
     dur_str    = f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}"
     interlaced = field not in ("progressive", "unknown", "")
+    step.done(f"{w}×{h}  {dur_str}  {'interlaced' if interlaced else 'progressive'}")
 
-    # Sample a frame for BRISQUE noise estimate
-    noise_label = "unknown"
-    noise_val   = None
+    # ── Step 2: extract sample frame ──────────────────────────────────────────
+    import tempfile
+    step = _Step(2, "Extracting sample frame")
+    tmp_frame: Path | None = None
     try:
-        import tempfile, piq
-        from torchvision.io import read_image
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp = Path(f.name)
-        mid = int(dur / 2 * 25)
-        _extract_frame(input_path, tmp, frame_n=mid)
-        img = read_image(str(tmp)).float().div(255.0).unsqueeze(0)
+            tmp_frame = Path(f.name)
+        mid_frame = int(dur / 2 * 25)
+        _extract_frame(input_path, tmp_frame, frame_n=mid_frame)
+        step.done(f"frame {mid_frame}")
+    except Exception as e:
+        step.skip(str(e))
+        tmp_frame = None
+
+    # ── Step 3: noise measurement (BRISQUE) ───────────────────────────────────
+    step = _Step(3, "Measuring noise level (BRISQUE)")
+    noise_label = "unavailable"
+    noise_val: float | None = None
+    try:
+        import piq
+        from torchvision.io import read_image
+        if tmp_frame is None:
+            raise RuntimeError("no frame extracted")
+        img = read_image(str(tmp_frame)).float().div(255.0).unsqueeze(0)
         noise_val = piq.brisque(img, data_range=1.0).item()
-        tmp.unlink(missing_ok=True)
         if noise_val < 20:
             noise_label = f"{noise_val:.1f}  (clean)"
+            noise_note  = "clean"
         elif noise_val < 40:
-            noise_label = f"{noise_val:.1f}  (moderate — denoising recommended)"
+            noise_label = f"{noise_val:.1f}  (moderate)"
+            noise_note  = "moderate"
         else:
-            noise_label = f"{noise_val:.1f}  (noisy — strong denoising recommended)"
-    except Exception:
-        noise_label = "unavailable (piq not installed)"
+            noise_label = f"{noise_val:.1f}  (noisy)"
+            noise_note  = "noisy"
+        step.done(noise_note)
+    except Exception as e:
+        step.skip(str(e))
+    finally:
+        if tmp_frame:
+            tmp_frame.unlink(missing_ok=True)
 
-    # Build suggested command
-    knlm = 0.8 if (noise_val or 0) < 20 else (2.0 if (noise_val or 0) >= 40 else 1.2)
+    total_elapsed = _time.perf_counter() - t_start
+    print(f"\n  Done in {total_elapsed:.1f}s")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    knlm    = 0.8 if (noise_val or 0) < 20 else (2.0 if (noise_val or 0) >= 40 else 1.2)
     skip_di = "--skip-deinterlace " if not interlaced else ""
     suggested = (
         f"python pipeline/restore.py restore {input_path.name} output.mkv \\\n"
         f"  {skip_di}--knlm-h {knlm:.1f} --scale 2 --codec ffv1"
     )
 
-    # Output
-    sep = "─" * 48
+    sep = "─" * 52
+    print()
     print(sep)
-    print(f"  File       {input_path.name}")
-    print(f"  Resolution {w}×{h}  {fps} fps")
-    print(f"  Codec      {codec}")
-    print(f"  Duration   {dur_str}")
-    print(f"  Interlaced {interlaced}  (field order: {field or 'unknown'})")
-    print(f"  Noise      {noise_label}")
+    print(f"  File        {input_path.name}")
+    print(f"  Resolution  {w}×{h}  ({fps} fps)")
+    print(f"  Codec       {codec}")
+    print(f"  Duration    {dur_str}")
+    print(f"  Interlaced  {'yes' if interlaced else 'no'}  (field order: {field or 'unknown'})")
+    print(f"  Noise       {noise_label}")
     print(sep)
     print()
     print("Profiles:")
-    for name, p in _PROFILES.items():
-        print(f"  --profile {name:<12}  {p['desc']}")
+    for name, prof in _PROFILES.items():
+        print(f"  --profile {name:<12}  {prof['desc']}")
     print()
     print("Suggested command:")
     print(f"  {suggested}")
