@@ -291,7 +291,7 @@ def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -
     script_path = work_dir / "pipeline.vpy"
     script_path.write_text(script)
 
-    vspipe_cmd = [_find_vspipe(), str(script_path), "-", "-f", "yuv4mpegpipe"]
+    vspipe_cmd = [_find_vspipe(), "-c", "y4m", str(script_path), "-"]
     ffmpeg_cmd = (
         ["ffmpeg", "-y", "-f", "yuv4mpegpipe", "-i", "pipe:"]
         + _ffv1_flags()
