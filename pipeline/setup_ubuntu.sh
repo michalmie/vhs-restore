@@ -303,10 +303,17 @@ if [ ! -d "$REALESRGAN_DIR" ]; then
     git clone https://github.com/xinntao/Real-ESRGAN "$REALESRGAN_DIR"
 fi
 cd "$REALESRGAN_DIR"
-echo "  Installing Real-ESRGAN requirements..."
-pip install -r requirements.txt
+echo "  Installing Real-ESRGAN requirements (excluding torch — managed separately)..."
+pip install -r requirements.txt --constraint <(echo "torch==$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo '0')" 2>/dev/null || true)
 python3 setup.py develop -q 2>/dev/null
 cd - > /dev/null
+
+# Re-pin torch to the correct CUDA wheel — Real-ESRGAN deps may have pulled a newer incompatible build
+CURRENT_CU=$(python3 -c "import torch; v=torch.__version__; print(v.split('+')[1] if '+' in v else 'none')" 2>/dev/null)
+if [ "$CURRENT_CU" != "$REQUIRED_CU" ]; then
+    warn "torch $CURRENT_CU was installed by Real-ESRGAN deps — reinstalling $REQUIRED_CU..."
+    pip install torch torchvision --index-url "$TORCH_INDEX" --force-reinstall --no-deps
+fi
 
 # basicsr ships a broken import for torchvision >= 0.17 — patch it
 DEGRADATIONS="$VENV/lib/python3.12/site-packages/basicsr/data/degradations.py"
