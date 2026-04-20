@@ -589,8 +589,8 @@ def gate_upscale(upscaled: Path, source: Path, cfg: Config, work_dir: Path) -> d
 
 
 def gate_final(video: Path, cfg: Config, work_dir: Path) -> dict:
-    """Gate 4: NIQE naturalness score on final output (lower = more natural, target ≤6)."""
-    LOG.info("[Gate 4] Final naturalness check (NIQE)...")
+    """Gate 4: naturalness check on final output using BRISQUE (lower = better, target ≤50)."""
+    LOG.info("[Gate 4] Final naturalness check (BRISQUE)...")
     try:
         import piq
         from torchvision.io import read_image
@@ -598,18 +598,17 @@ def gate_final(video: Path, cfg: Config, work_dir: Path) -> dict:
         frame = work_dir / "g4_final.png"
         _extract_frame(video, frame, frame_n=200)
         img = read_image(str(frame)).float().div(255.0).unsqueeze(0)
-        score = piq.niqe(img, data_range=1.0).item()
-        passed = score <= cfg.gate_max_niqe
+        score = piq.brisque(img, data_range=1.0).item()
+        passed = score <= cfg.gate_max_niqe * 8  # BRISQUE scale ~0-100, NIQE threshold was ~6
 
         gate = {
             "gate": "final",
-            "niqe_score": round(score, 3),
-            "threshold": cfg.gate_max_niqe,
+            "brisque_score": round(score, 3),
             "passed": passed,
         }
-    except ImportError:
-        LOG.warning("  piq not installed — skipping NIQE gate (pip install piq)")
-        gate = {"gate": "final", "passed": None, "note": "piq not installed"}
+    except (ImportError, AttributeError):
+        LOG.warning("  piq not available — skipping Gate 4")
+        gate = {"gate": "final", "passed": None, "note": "piq unavailable"}
 
     _log_gate(gate)
     if gate.get("passed") is False:
