@@ -284,12 +284,13 @@ else
     echo "  CUDA $CUDA_MAJOR detected → PyTorch cu118 (CUDA 11.x)"
 fi
 
-# Skip if already installed with the right CUDA build
-if python3 -c "import torch; assert 'cu118' in torch.__version__ or 'cu12' in torch.__version__ or torch.cuda.is_available()" 2>/dev/null; then
+# Skip only if installed build matches required CUDA wheel
+REQUIRED_CU=$(basename "$TORCH_INDEX")  # e.g. cu121
+if python3 -c "import torch; v=torch.__version__; exit(0 if '${REQUIRED_CU}' in v else 1)" 2>/dev/null; then
     ok "PyTorch already installed ($(python3 -c 'import torch; print(torch.__version__)'))"
 else
     echo "  Downloading PyTorch (~2 GB — this will take several minutes)..."
-    pip install torch torchvision --index-url "$TORCH_INDEX"
+    pip install torch torchvision --index-url "$TORCH_INDEX" --upgrade
 fi
 
 # Real-ESRGAN
