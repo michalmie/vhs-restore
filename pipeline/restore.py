@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -33,6 +34,43 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 LOG = logging.getLogger("vhs")
+
+# ── Environment check ─────────────────────────────────────────────────────────
+_VENV = Path.home() / "vhs-env"
+_VSPIPE_SEARCH = ["/usr/local/bin/vspipe", str(_VENV / "bin" / "vspipe")]
+
+def _find_vspipe() -> str:
+    for p in _VSPIPE_SEARCH:
+        if Path(p).exists():
+            return p
+    found = shutil.which("vspipe")
+    if found:
+        return found
+    return ""
+
+def _check_env() -> None:
+    errors = []
+    if not os.environ.get("VIRTUAL_ENV") and not (_VENV / "bin" / "activate").exists():
+        errors.append(
+            f"venv not found at {_VENV}\n"
+            f"  Run setup first:  bash pipeline/setup_ubuntu.sh"
+        )
+    elif not os.environ.get("VIRTUAL_ENV"):
+        errors.append(
+            f"venv not activated — run:\n"
+            f"  source {_VENV}/bin/activate"
+        )
+    if not _find_vspipe():
+        errors.append(
+            "vspipe not found — VapourSynth not installed or not in PATH\n"
+            "  Expected at /usr/local/bin/vspipe\n"
+            "  Re-run setup:  bash pipeline/setup_ubuntu.sh"
+        )
+    if errors:
+        print("\nERROR: environment not ready:\n", file=sys.stderr)
+        for e in errors:
+            print(f"  • {e}\n", file=sys.stderr)
+        sys.exit(1)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -253,7 +291,7 @@ def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -
     script_path = work_dir / "pipeline.vpy"
     script_path.write_text(script)
 
-    vspipe_cmd = ["vspipe", str(script_path), "-", "-f", "yuv4mpegpipe"]
+    vspipe_cmd = [_find_vspipe(), str(script_path), "-", "-f", "yuv4mpegpipe"]
     ffmpeg_cmd = (
         ["ffmpeg", "-y", "-f", "yuv4mpegpipe", "-i", "pipe:"]
         + _ffv1_flags()
@@ -692,6 +730,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _check_env()
     parser = _build_parser()
     args = parser.parse_args()
 
