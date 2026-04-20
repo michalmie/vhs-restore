@@ -240,6 +240,7 @@ def _extract_frame(video: Path, out_png: Path, frame_n: int = 100) -> None:
         "-i", str(video),
         "-vf", f"select=eq(n\\,{frame_n})",
         "-frames:v", "1",
+        "-pix_fmt", "rgb24",  # force 8-bit so piq receives values in 0-255
         str(out_png),
     ])
 
