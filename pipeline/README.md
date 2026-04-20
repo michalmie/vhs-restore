@@ -305,7 +305,8 @@ A failed gate does not stop the pipeline — it logs a specific tuning suggestio
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--test` | off | Process a 30-second clip only (fast tuning iterations) |
-| `--test-start` | `00:05:00` | Where in the file the test clip starts |
+| `--test-sample` | off | Auto-pick clip from the middle of the video (probes duration; overrides `--test-start`) |
+| `--test-start` | `00:05:00` | Where in the file the test clip starts (ignored when `--test-sample` is set) |
 | `--test-duration` | `30` | Test clip length in seconds |
 
 ### Verbosity

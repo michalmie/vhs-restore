@@ -77,6 +77,7 @@ class Config:
     test_mode: bool = False
     test_start: str = "00:05:00"
     test_duration: int = 30
+    test_sample: bool = False  # auto-pick start from middle of video
 
 
 # ── VapourSynth script template ───────────────────────────────────────────────
@@ -153,6 +154,23 @@ def _run_live(cmd: list[str | Path]) -> None:
     """Run command streaming output to terminal (for long-running stages)."""
     LOG.debug("$ %s", " ".join(str(c) for c in cmd))
     subprocess.run(cmd, check=True)
+
+
+def _probe_duration(path: Path) -> float:
+    r = _run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+    return float(r.stdout.strip())
+
+
+def _seconds_to_hms(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
 def _probe_fps(path: Path) -> str:
@@ -524,16 +542,28 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
     audio_source = input_path  # always use original audio
 
     try:
-        # Test mode: extract a 30-second representative clip
+        # Test mode: extract a representative clip
         if cfg.test_mode:
-            LOG.info(
-                "TEST MODE — extracting %ds clip from %s (start: %s)",
-                cfg.test_duration, input_path.name, cfg.test_start,
-            )
+            test_start = cfg.test_start
+            if cfg.test_sample:
+                duration = _probe_duration(input_path)
+                mid = duration / 2.0
+                start_sec = max(0.0, mid - cfg.test_duration / 2.0)
+                test_start = _seconds_to_hms(start_sec)
+                LOG.info(
+                    "TEST MODE (auto-sample) — video duration %.1fs, sampling %ds clip "
+                    "from middle at %s",
+                    duration, cfg.test_duration, test_start,
+                )
+            else:
+                LOG.info(
+                    "TEST MODE — extracting %ds clip from %s (start: %s)",
+                    cfg.test_duration, input_path.name, test_start,
+                )
             clip = work_dir / "test_clip.mkv"
             _run_live([
                 "ffmpeg", "-y",
-                "-ss", cfg.test_start,
+                "-ss", test_start,
                 "-t", str(cfg.test_duration),
                 "-i", str(input_path),
                 "-c", "copy",
@@ -652,7 +682,9 @@ def _build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("Test mode")
     g.add_argument("--test",           action="store_true", dest="test_mode",
                    help="Process 30-second sample clip only")
-    g.add_argument("--test-start",     default="00:05:00",  help="Clip start time HH:MM:SS")
+    g.add_argument("--test-sample",    action="store_true", dest="test_sample",
+                   help="Auto-pick clip from middle of video (probes duration, overrides --test-start)")
+    g.add_argument("--test-start",     default="00:05:00",  help="Clip start time HH:MM:SS (ignored when --test-sample is set)")
     g.add_argument("--test-duration",  type=int, default=30, help="Clip length in seconds")
 
     p.add_argument("-v", "--verbose", action="store_true")
