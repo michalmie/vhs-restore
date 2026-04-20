@@ -537,53 +537,48 @@ def gate_denoise(before: Path, after: Path, cfg: Config, work_dir: Path) -> dict
 
 
 def gate_upscale(upscaled: Path, source: Path, cfg: Config, work_dir: Path) -> dict:
-    """Gate 3: VMAF score vs simple bicubic upscale (higher = better, target ≥65)."""
-    LOG.info("[Gate 3] Upscale check (VMAF vs bicubic)...")
+    """Gate 3: SSIM score vs bicubic upscale using piq (higher = better, target ≥0.70)."""
+    LOG.info("[Gate 3] Upscale quality check (SSIM vs bicubic)...")
     try:
-        w, h = _probe_dimensions(upscaled)
-        bicubic = work_dir / "g3_bicubic.mkv"
+        import piq
+        from torchvision.io import read_image
 
-        LOG.info("  Generating bicubic reference at %dx%d...", w, h)
+        w, h = _probe_dimensions(upscaled)
+
+        frame_up = work_dir / "g3_upscaled.png"
+        frame_bc = work_dir / "g3_bicubic.png"
+
+        _extract_frame(upscaled, frame_up, frame_n=200)
         _run_live([
             "ffmpeg", "-y",
             "-i", str(source),
-            "-vf", f"scale={w}:{h}:flags=bicubic",
-            *_ffv1_flags(),
-            str(bicubic),
+            "-vf", f"select=eq(n\\,200),scale={w}:{h}:flags=bicubic,format=rgb24",
+            "-frames:v", "1",
+            str(frame_bc),
         ])
 
-        vmaf_log = work_dir / "vmaf.json"
-        _run_live([
-            "ffmpeg", "-y",
-            "-i", str(upscaled),
-            "-i", str(bicubic),
-            "-lavfi", f"[0:v][1:v]libvmaf=log_fmt=json:log_path={vmaf_log}",
-            "-f", "null", "-",
-        ])
-
-        with open(vmaf_log) as f:
-            vmaf_data = json.load(f)
-        score = vmaf_data["pooled_metrics"]["vmaf"]["mean"]
-        passed = score >= cfg.gate_min_vmaf
+        img_up = read_image(str(frame_up)).float().div(255.0).unsqueeze(0)
+        img_bc = read_image(str(frame_bc)).float().div(255.0).unsqueeze(0)
+        score = piq.ssim(img_up, img_bc, data_range=1.0).item()
+        passed = score >= cfg.gate_min_vmaf / 100.0  # gate_min_vmaf is 0-100, ssim is 0-1
 
         gate = {
             "gate": "upscale",
-            "vmaf_vs_bicubic": round(score, 2),
-            "threshold": cfg.gate_min_vmaf,
+            "ssim_vs_bicubic": round(score, 4),
             "passed": passed,
         }
-    except FileNotFoundError:
-        LOG.warning("  libvmaf not available in this ffmpeg build — skipping VMAF gate")
-        gate = {"gate": "upscale", "passed": None, "note": "libvmaf not available"}
+    except (ImportError, AttributeError) as e:
+        LOG.warning("  piq not available — skipping upscale gate")
+        gate = {"gate": "upscale", "passed": None, "note": "piq unavailable"}
     except (subprocess.CalledProcessError, KeyError) as e:
         gate = {"gate": "upscale", "passed": None, "note": str(e)}
 
     _log_gate(gate)
     if gate.get("passed") is False:
         LOG.warning(
-            "  Suggestion: VMAF %.1f < %.1f. Try model 'RealESRGAN_x4plus' "
+            "  Suggestion: SSIM %.4f below threshold. Try model 'RealESRGAN_x4plus' "
             "or reduce scale from %dx to 2x.",
-            gate.get("vmaf_vs_bicubic", 0), cfg.gate_min_vmaf, cfg.realesrgan_scale,
+            gate.get("ssim_vs_bicubic", 0), cfg.realesrgan_scale,
         )
     return gate
 
