@@ -404,6 +404,7 @@ def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Pa
         "-i", str(frames_in),
         "-o", str(frames_out),
         "-s", str(cfg.realesrgan_scale),
+        "--suffix", "",  # keep original filename; default adds "_out" suffix
         *tile_args,
     ])
 
