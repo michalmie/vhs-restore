@@ -139,7 +139,8 @@ class Config:
     test_mode: bool = False
     test_start: str = "00:05:00"
     test_duration: int = 30
-    test_sample: bool = False  # auto-pick start from middle of video
+    test_sample: bool = False   # auto-pick start from middle of video
+    compare: bool = False       # generate side-by-side comparison video
 
 
 # ── VapourSynth script template ───────────────────────────────────────────────
@@ -996,6 +997,17 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             report["gates"].append(g4)
             ui.finish_gate(g4)
 
+        # ── Comparison video ──
+        compare_path: Path | None = None
+        if cfg.compare:
+            compare_path = output_path.with_name(
+                output_path.stem + "_compare.mp4"
+            )
+            ui.start_stage(4, "Side-by-side comparison")
+            make_comparison(audio_source, output_path, compare_path,
+                            on_progress=ui.on_progress)
+            ui.finish_stage(4)
+
         # ── Report ──
         passed = sum(1 for g in report["gates"] if g.get("passed") is True)
         total  = sum(1 for g in report["gates"] if g.get("passed") is not None)
@@ -1004,7 +1016,7 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
         report_path = output_path.with_suffix("").with_suffix(".quality_report.json")
         report_path.write_text(json.dumps(report, indent=2))
 
-        ui.show_summary(passed, total, output_path, report_path)
+        ui.show_summary(passed, total, output_path, report_path, compare_path)
 
         return report
 
@@ -1013,6 +1025,53 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             shutil.rmtree(work_dir, ignore_errors=True)
         else:
             LOG.info("Intermediates kept at: %s", work_dir)
+
+
+# ── Side-by-side comparison ───────────────────────────────────────────────────
+
+def make_comparison(
+    original: Path,
+    processed: Path,
+    output: Path,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> None:
+    """Render original (left) vs restored (right) side-by-side as H.264 MP4.
+
+    Both sides are scaled to the processed video's height so the upscaling
+    quality improvement is visible. A label is burned into each half.
+    """
+    w, h = _probe_dimensions(processed)
+    total = _probe_frame_count(processed)
+
+    # Scale original to match processed dimensions (bicubic, same as baseline)
+    # Then hstack with the processed video; burn "ORIGINAL" / "RESTORED" labels.
+    filter_complex = (
+        f"[0:v]scale={w}:{h}:flags=lanczos,"
+        f"drawtext=text='ORIGINAL':fontsize={max(18, h//30)}:fontcolor=white"
+        f":shadowcolor=black:shadowx=2:shadowy=2:x=20:y=20[left];"
+        f"[1:v]scale={w}:{h}:flags=lanczos,"
+        f"drawtext=text='RESTORED':fontsize={max(18, h//30)}:fontcolor=white"
+        f":shadowcolor=black:shadowx=2:shadowy=2:x=20:y=20[right];"
+        "[left][right]hstack=inputs=2[out]"
+    )
+
+    _run_tracking(
+        [
+            "ffmpeg", "-y",
+            "-i", str(original),
+            "-i", str(processed),
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-map", "1:a?",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            "-c:a", "aac",
+            str(output),
+        ],
+        on_stderr=lambda l: (
+            on_progress("compare", int(m.group(1)), total)
+            if (m := re.search(r"frame=\s*(\d+)", l)) and on_progress else None
+        ),
+    )
 
 
 # ── TUI ───────────────────────────────────────────────────────────────────────
@@ -1145,16 +1204,20 @@ class PipelineUI:
 
     # ── summary ───────────────────────────────────────────────────────────────
 
-    def show_summary(self, passed: int, total: int, output: Path, report: Path) -> None:
+    def show_summary(
+        self, passed: int, total: int, output: Path, report: Path,
+        compare: Path | None = None,
+    ) -> None:
         color = "green" if passed == total else "yellow"
+        lines = [
+            f"[{color}]Gates: {passed}/{total} passed[/]",
+            f"Output:   {output}",
+            f"Report:   {report}",
+        ]
+        if compare:
+            lines.append(f"Compare:  [cyan]{compare}[/]  ← play this to see before/after")
         _CONSOLE.print()
-        _CONSOLE.print(Panel(
-            f"[{color}]Gates: {passed}/{total} passed[/]\n"
-            f"Output:  {output}\n"
-            f"Report:  {report}",
-            title="[bold green]Done[/]",
-            border_style=color,
-        ))
+        _CONSOLE.print(Panel("\n".join(lines), title="[bold green]Done[/]", border_style=color))
 
 
 # ── Profiles ──────────────────────────────────────────────────────────────────
@@ -1342,9 +1405,11 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     base_cmd = f"python pipeline/restore.py restore {input_path.name}"
     flags_str = " ".join(extra_flags)
 
-    test_30  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 30 {flags_str}"
-    test_60  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 60 {flags_str}"
-    full_cmd = f"{base_cmd} output.mkv {flags_str}"
+    fstr = flags_str.strip()
+    sep  = (" " + fstr) if fstr else ""
+    test_30  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 30 --compare{sep}"
+    test_60  = f"{base_cmd} preview.mkv --test --test-sample --test-duration 60 --compare{sep}"
+    full_cmd = f"{base_cmd} output.mkv{sep}"
 
     test_table = Table(box=None, show_header=False, padding=(0, 1))
     test_table.add_column(style="dim", width=12)
@@ -1498,6 +1563,8 @@ def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Sample start time HH:MM:SS (overridden by --test-sample)")
     g.add_argument("--test-duration", type=int, default=30,
                    help="Sample length in seconds")
+    g.add_argument("--compare", action="store_true",
+                   help="Generate a side-by-side before/after comparison video alongside output")
 
     g = p.add_argument_group("Quality gate thresholds")
     g.add_argument("--gate-progressive-pct", type=float, default=0.95,
