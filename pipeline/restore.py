@@ -12,11 +12,32 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
+
+from rich.columns import Columns
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
+from rich.text import Text
 
 LOG = logging.getLogger("vhs")
-_VERBOSE = False  # set to True via --verbose; controls whether ffmpeg output is shown
+_VERBOSE = False  # set to True via --verbose; controls whether subprocess output is shown
+_CONSOLE = Console()
 
 # ── Environment check ─────────────────────────────────────────────────────────
 _VENV = Path.home() / "vhs-env"
@@ -174,7 +195,7 @@ def _run(cmd: list[str | Path], **kwargs) -> subprocess.CompletedProcess:
 
 
 def _run_live(cmd: list[str | Path]) -> None:
-    """Run a long-running command. Output shown only in --verbose mode; on failure always shown."""
+    """Run a long-running command. Output shown only in --verbose mode; always shown on failure."""
     LOG.debug("$ %s", " ".join(str(c) for c in cmd))
     if _VERBOSE:
         subprocess.run(cmd, check=True)
@@ -185,6 +206,46 @@ def _run_live(cmd: list[str | Path]) -> None:
         sys.stderr.buffer.write(result.stderr)
         sys.stderr.flush()
         raise subprocess.CalledProcessError(result.returncode, cmd)
+
+
+def _run_tracking(
+    cmd: list[str | Path],
+    *,
+    on_stderr: Callable[[str], None] | None = None,
+    on_stdout: Callable[[str], None] | None = None,
+) -> None:
+    """Run command and stream output to optional line callbacks for progress parsing."""
+    LOG.debug("$ %s", " ".join(str(c) for c in cmd))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    captured_err: list[str] = []
+
+    def _drain(stream, cb, store):
+        for line in stream:
+            line = line.rstrip()
+            store.append(line)
+            if cb:
+                cb(line)
+        stream.close()
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, on_stdout, []))
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, on_stderr, captured_err))
+    t_out.start()
+    t_err.start()
+    proc.wait()
+    t_out.join()
+    t_err.join()
+
+    if proc.returncode != 0:
+        for line in captured_err:
+            _CONSOLE.print(line, style="red", highlight=False)
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
 
 
 def _probe_duration(path: Path) -> float:
@@ -213,6 +274,28 @@ def _probe_fps(path: Path) -> str:
         str(path),
     ])
     return r.stdout.strip()
+
+
+def _probe_frame_count(path: Path) -> int:
+    """Estimate frame count from container metadata (fast, no decoding)."""
+    try:
+        r = _run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ])
+        val = r.stdout.strip()
+        if val and val != "N/A":
+            return int(val)
+        # Fallback: duration × fps
+        dur = _probe_duration(path)
+        fps_str = _probe_fps(path)
+        num, den = (fps_str.split("/") + ["1"])[:2]
+        return int(dur * int(num) / int(den))
+    except Exception:
+        return 0
 
 
 def _probe_dimensions(path: Path) -> tuple[int, int]:
@@ -304,7 +387,10 @@ def _vs_plugins_available() -> bool:
         return False
 
 
-def _stage_vs_ffmpeg(input_path: Path, output_path: Path, cfg: Config) -> None:
+def _stage_vs_ffmpeg(
+    input_path: Path, output_path: Path, cfg: Config,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> None:
     """Stage 1 fallback using ffmpeg filters (progressive sources only).
 
     Used when VapourSynth plugins (ffms2, KNLMeansCL) are not installed.
@@ -330,21 +416,31 @@ def _stage_vs_ffmpeg(input_path: Path, output_path: Path, cfg: Config) -> None:
             f":bimin={lo:.4f}:bimax={hi:.4f}"
         )
 
+    total = _probe_frame_count(input_path)
     cmd = (
         ["ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters)]
         + _ffv1_flags()
         + [str(output_path)]
     )
-    _run_live(cmd)
+    _run_tracking(
+        cmd,
+        on_stderr=lambda l: (
+            on_progress("vs", int(m.group(1)), total)
+            if (m := re.search(r"frame=\s*(\d+)", l)) and on_progress else None
+        ),
+    )
     LOG.info("  Stage 1 complete (ffmpeg fallback) → %s", output_path)
 
 
-def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -> None:
+def stage_vs(
+    input_path: Path, output_path: Path, cfg: Config, work_dir: Path,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> None:
     if cfg.skip_deinterlace:
         LOG.info("[Stage 1] Denoise + Color correction (deinterlace skipped — progressive source)")
         # Use ffmpeg fallback when VapourSynth plugins are missing (progressive only)
         if not _vs_plugins_available():
-            _stage_vs_ffmpeg(input_path, output_path, cfg)
+            _stage_vs_ffmpeg(input_path, output_path, cfg, on_progress)
             return
         template = _VS_TEMPLATE_PROGRESSIVE
     else:
@@ -377,9 +473,19 @@ def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -
     )
 
     LOG.info("  vspipe | ffmpeg  (this will take a while — QTGMC + KNLMeansCL)...")
+    total = _probe_frame_count(input_path)
     vspipe = subprocess.Popen(vspipe_cmd, stdout=subprocess.PIPE)
-    ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=vspipe.stdout)
+    ffmpeg = subprocess.Popen(
+        ffmpeg_cmd, stdin=vspipe.stdout,
+        stderr=subprocess.PIPE, text=True, errors="replace",
+    )
     vspipe.stdout.close()
+
+    for line in ffmpeg.stderr:
+        m = re.search(r"frame=\s*(\d+)", line)
+        if m and on_progress:
+            on_progress("vs", int(m.group(1)), total)
+
     ffmpeg.wait()
     vspipe.wait()
 
@@ -391,7 +497,10 @@ def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -
 
 # ── Stage 2: Real-ESRGAN upscaling ───────────────────────────────────────────
 
-def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -> None:
+def stage_upscale(
+    input_path: Path, output_path: Path, cfg: Config, work_dir: Path,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> None:
     LOG.info(
         "[Stage 2] Upscaling %dx with %s (tile=%d)",
         cfg.realesrgan_scale, cfg.realesrgan_model, cfg.realesrgan_tile,
@@ -403,13 +512,19 @@ def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Pa
     frames_out.mkdir(exist_ok=True)
 
     fps = _probe_fps(input_path)
+    total_frames = _probe_frame_count(input_path)
     LOG.info("  Extracting frames (source fps=%s)...", fps)
-    _run_live([
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-vf", "format=rgb24",  # force 8-bit before PNG encode (pix_fmt alone ignored for image2)
-        str(frames_in / "frame_%08d.png"),
-    ])
+
+    def _ffmpeg_frame_cb(line: str, on_progress):
+        m = re.search(r"frame=\s*(\d+)", line)
+        if m and on_progress:
+            on_progress("extract", int(m.group(1)), total_frames)
+
+    _run_tracking(
+        ["ffmpeg", "-y", "-i", str(input_path), "-vf", "format=rgb24",
+         str(frames_in / "frame_%08d.png")],
+        on_stderr=lambda l: _ffmpeg_frame_cb(l, on_progress),
+    )
 
     realesrgan_script = Path(cfg.realesrgan_dir).expanduser() / "inference_realesrgan.py"
     if not realesrgan_script.exists():
@@ -421,24 +536,28 @@ def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Pa
 
     tile_args = ["--tile", str(cfg.realesrgan_tile)] if cfg.realesrgan_tile > 0 else []
     LOG.info("  Running Real-ESRGAN inference...")
-    _run_live([
-        sys.executable, str(realesrgan_script),
-        "-n", cfg.realesrgan_model,
-        "-i", str(frames_in),
-        "-o", str(frames_out),
-        "-s", str(cfg.realesrgan_scale),
-        "--suffix", "",  # keep original filename; default adds "_out" suffix
-        *tile_args,
-    ])
+
+    def _realesrgan_cb(line: str, on_progress):
+        m = re.search(r"Testing\s+(\d+)", line)
+        if m and on_progress:
+            on_progress("upscale", int(m.group(1)) + 1, total_frames)
+
+    _run_tracking(
+        [sys.executable, str(realesrgan_script),
+         "-n", cfg.realesrgan_model,
+         "-i", str(frames_in), "-o", str(frames_out),
+         "-s", str(cfg.realesrgan_scale),
+         "--suffix", "", *tile_args],
+        on_stdout=lambda l: _realesrgan_cb(l, on_progress),
+    )
 
     LOG.info("  Reassembling frames → %s", output_path)
-    _run_live([
-        "ffmpeg", "-y",
-        "-framerate", fps,
-        "-i", str(frames_out / "frame_%08d.png"),
-        *_ffv1_flags(),
-        str(output_path),
-    ])
+    _run_tracking(
+        ["ffmpeg", "-y", "-framerate", fps,
+         "-i", str(frames_out / "frame_%08d.png"),
+         *_ffv1_flags(), str(output_path)],
+        on_stderr=lambda l: _ffmpeg_frame_cb(l, on_progress),
+    )
 
     LOG.info("  Stage 2 complete → %s", output_path)
 
@@ -446,7 +565,8 @@ def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Pa
 # ── Stage 3: Film grain + final encode ───────────────────────────────────────
 
 def stage_final(
-    video: Path, audio_source: Path, output_path: Path, cfg: Config
+    video: Path, audio_source: Path, output_path: Path, cfg: Config,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> None:
     LOG.info("[Stage 3] Film grain (strength=%d) + final encode (%s)", cfg.grain_strength, cfg.output_codec)
 
@@ -458,18 +578,20 @@ def stage_final(
         filters.append(f"noise=alls={cfg.grain_strength}:allf=t+u")
 
     audio_codec = "aac" if cfg.output_codec in ("h264", "h265") else "flac"
+    total = _probe_frame_count(video)
 
-    _run_live([
-        "ffmpeg", "-y",
-        "-i", str(video),
-        "-i", str(audio_source),
-        "-map", "0:v",
-        "-map", "1:a",
-        *(["-vf", ",".join(filters)] if filters else []),
-        *_video_flags(cfg),
-        "-c:a", audio_codec,
-        str(output_path),
-    ])
+    _run_tracking(
+        ["ffmpeg", "-y",
+         "-i", str(video), "-i", str(audio_source),
+         "-map", "0:v", "-map", "1:a",
+         *(["-vf", ",".join(filters)] if filters else []),
+         *_video_flags(cfg), "-c:a", audio_codec,
+         str(output_path)],
+        on_stderr=lambda l: (
+            on_progress("final", int(m.group(1)), total)
+            if (m := re.search(r"frame=\s*(\d+)", l)) and on_progress else None
+        ),
+    )
 
     LOG.info("  Stage 3 complete → %s", output_path)
 
@@ -717,25 +839,46 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             "gates": [],
         }
 
-        # ── Stage 1 ──
-        vs_out = work_dir / "s1_vs.mkv"
-        stage_vs(input_path, vs_out, cfg, work_dir)
-        if not cfg.skip_deinterlace:
-            g1 = gate_deinterlace(vs_out, cfg)
-            report["gates"].append(g1)
-        g2 = gate_denoise(input_path, vs_out, cfg, work_dir)
-        report["gates"].append(g2)
+        ui = PipelineUI(input_path, output_path, cfg)
 
-        # ── Stage 2 ──
-        upscaled_out = work_dir / "s2_upscaled.mkv"
-        stage_upscale(vs_out, upscaled_out, cfg, work_dir)
-        g3 = gate_upscale(upscaled_out, vs_out, cfg, work_dir)
-        report["gates"].append(g3)
+        with ui:
+            # ── Stage 1 ──
+            vs_out = work_dir / "s1_vs.mkv"
+            ui.start_stage(1, "Deinterlace + Denoise")
+            stage_vs(input_path, vs_out, cfg, work_dir, on_progress=ui.on_progress)
+            ui.finish_stage(1)
 
-        # ── Stage 3 ──
-        stage_final(upscaled_out, audio_source, output_path, cfg)
-        g4 = gate_final(output_path, cfg, work_dir)
-        report["gates"].append(g4)
+            if not cfg.skip_deinterlace:
+                ui.start_gate("Gate 1", "Deinterlace")
+                g1 = gate_deinterlace(vs_out, cfg)
+                report["gates"].append(g1)
+                ui.finish_gate(g1)
+
+            ui.start_gate("Gate 2", "Denoise")
+            g2 = gate_denoise(input_path, vs_out, cfg, work_dir)
+            report["gates"].append(g2)
+            ui.finish_gate(g2)
+
+            # ── Stage 2 ──
+            upscaled_out = work_dir / "s2_upscaled.mkv"
+            ui.start_stage(2, "AI Upscaling (Real-ESRGAN)")
+            stage_upscale(vs_out, upscaled_out, cfg, work_dir, on_progress=ui.on_progress)
+            ui.finish_stage(2)
+
+            ui.start_gate("Gate 3", "Upscale quality")
+            g3 = gate_upscale(upscaled_out, vs_out, cfg, work_dir)
+            report["gates"].append(g3)
+            ui.finish_gate(g3)
+
+            # ── Stage 3 ──
+            ui.start_stage(3, "Film Grain + Final Encode")
+            stage_final(upscaled_out, audio_source, output_path, cfg, on_progress=ui.on_progress)
+            ui.finish_stage(3)
+
+            ui.start_gate("Gate 4", "Final quality")
+            g4 = gate_final(output_path, cfg, work_dir)
+            report["gates"].append(g4)
+            ui.finish_gate(g4)
 
         # ── Report ──
         passed = sum(1 for g in report["gates"] if g.get("passed") is True)
@@ -745,10 +888,7 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
         report_path = output_path.with_suffix("").with_suffix(".quality_report.json")
         report_path.write_text(json.dumps(report, indent=2))
 
-        LOG.info("─" * 60)
-        LOG.info("Done.  Gates: %d/%d passed", passed, total)
-        LOG.info("Output:  %s", output_path)
-        LOG.info("Report:  %s", report_path)
+        ui.show_summary(passed, total, output_path, report_path)
 
         return report
 
@@ -757,6 +897,148 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             shutil.rmtree(work_dir, ignore_errors=True)
         else:
             LOG.info("Intermediates kept at: %s", work_dir)
+
+
+# ── TUI ───────────────────────────────────────────────────────────────────────
+
+_STAGE_LABELS = {1: "Stage 1", 2: "Stage 2", 3: "Stage 3"}
+_GATE_ICON = {True: "[green]✓[/]", False: "[red]✗[/]", None: "[dim]–[/]"}
+
+
+class PipelineUI:
+    """Rich Live dashboard for the restore pipeline."""
+
+    def __init__(self, input_path: Path, output_path: Path, cfg: Config) -> None:
+        self._input = input_path
+        self._output = output_path
+        self._cfg = cfg
+
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(bar_width=32),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            expand=False,
+        )
+        self._stage_tasks: dict[int, TaskID] = {}
+        self._gates: list[tuple[str, str, str]] = []  # (label, name, status_markup)
+        self._lock = threading.Lock()
+        self._live = Live(self._render(), refresh_rate=8, console=_CONSOLE)
+
+    # ── context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self):
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        self._live.__exit__(*args)
+
+    # ── stage control ─────────────────────────────────────────────────────────
+
+    def start_stage(self, n: int, name: str) -> None:
+        tid = self._progress.add_task(f"[cyan]Stage {n}[/]  {name}", total=None)
+        with self._lock:
+            self._stage_tasks[n] = tid
+        self._refresh()
+
+    def finish_stage(self, n: int) -> None:
+        with self._lock:
+            tid = self._stage_tasks.get(n)
+        if tid is not None:
+            self._progress.update(tid, completed=True, total=1,
+                                  description=f"[green]Stage {n}[/]  ✓")
+        self._refresh()
+
+    def on_progress(self, step: str, done: int, total: int) -> None:
+        stage_map = {"vs": 1, "extract": 2, "upscale": 2, "final": 3}
+        n = stage_map.get(step, 0)
+        with self._lock:
+            tid = self._stage_tasks.get(n)
+        if tid is not None and total > 0:
+            self._progress.update(tid, completed=done, total=total)
+        self._refresh()
+
+    # ── gate control ──────────────────────────────────────────────────────────
+
+    def start_gate(self, label: str, name: str) -> None:
+        with self._lock:
+            self._gates.append((label, name, "[dim]running…[/]"))
+        self._refresh()
+
+    def finish_gate(self, gate: dict) -> None:
+        passed = gate.get("passed")
+        icon   = _GATE_ICON[passed]
+        detail = self._gate_detail(gate)
+        with self._lock:
+            if self._gates:
+                label, name, _ = self._gates[-1]
+                self._gates[-1] = (label, name, f"{icon}  {detail}")
+        self._refresh()
+
+    @staticmethod
+    def _gate_detail(gate: dict) -> str:
+        if "progressive_pct" in gate:
+            return f"{gate['progressive_pct']*100:.1f}% progressive"
+        if "delta" in gate:
+            return f"BRISQUE Δ{gate['delta']:+.1f}"
+        if "ssim_vs_bicubic" in gate:
+            return f"SSIM {gate['ssim_vs_bicubic']:.3f}"
+        if "brisque_score" in gate:
+            return f"BRISQUE {gate['brisque_score']:.1f}"
+        return gate.get("note", "")
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+
+    def _render(self):
+        # Header
+        codec_label = self._cfg.output_codec.upper()
+        if self._cfg.output_codec in ("h264", "h265"):
+            codec_label += f" CRF{self._cfg.output_crf}"
+        res_label = (
+            f"  ·  → {self._cfg.output_res}"
+            if self._cfg.output_res != "native" else ""
+        )
+        header = (
+            f"[bold]{self._input.name}[/]  →  [bold]{self._output.name}[/]\n"
+            f"[dim]{codec_label}  ·  {self._cfg.realesrgan_scale}× upscale"
+            f"  ·  grain {self._cfg.grain_strength}{res_label}[/]"
+        )
+
+        # Gates table
+        gate_table = Table(box=None, padding=(0, 2, 0, 0), show_header=False)
+        gate_table.add_column(style="dim", width=8)
+        gate_table.add_column(width=18)
+        gate_table.add_column()
+        with self._lock:
+            gates_snapshot = list(self._gates)
+        for label, name, status in gates_snapshot:
+            gate_table.add_row(label, name, status)
+
+        return Panel(
+            Columns([self._progress, gate_table], equal=False, expand=True),
+            title="[bold blue]VHS Restore Pipeline[/]",
+            subtitle=header,
+            border_style="blue",
+        )
+
+    def _refresh(self) -> None:
+        self._live.update(self._render())
+
+    # ── summary ───────────────────────────────────────────────────────────────
+
+    def show_summary(self, passed: int, total: int, output: Path, report: Path) -> None:
+        color = "green" if passed == total else "yellow"
+        _CONSOLE.print()
+        _CONSOLE.print(Panel(
+            f"[{color}]Gates: {passed}/{total} passed[/]\n"
+            f"Output:  {output}\n"
+            f"Report:  {report}",
+            title="[bold green]Done[/]",
+            border_style=color,
+        ))
 
 
 # ── Profiles ──────────────────────────────────────────────────────────────────
@@ -790,116 +1072,107 @@ _PROFILES: dict[str, dict] = {
 
 # ── Analyze command ───────────────────────────────────────────────────────────
 
-import time as _time
-
-
-class _Step:
-    """Print a step label, then overwrite with timing when done."""
-
-    _STEPS_TOTAL = 3
-
-    def __init__(self, n: int, label: str) -> None:
-        self._label = label
-        self._n = n
-        self._t0 = _time.perf_counter()
-        print(f"  [{n}/{self._STEPS_TOTAL}] {label}...", end="", flush=True)
-
-    def done(self, note: str = "") -> None:
-        elapsed = _time.perf_counter() - self._t0
-        suffix = f"  {note}" if note else ""
-        print(f"\r  [{self._n}/{self._STEPS_TOTAL}] {self._label}  {elapsed:.1f}s{suffix}")
-
-    def skip(self, reason: str) -> None:
-        print(f"\r  [{self._n}/{self._STEPS_TOTAL}] {self._label}  skipped ({reason})")
 
 
 def cmd_analyze(args: argparse.Namespace) -> None:
+    import tempfile
+
     input_path = args.input.resolve()
     if not input_path.exists():
-        print(f"error: file not found: {input_path}", file=sys.stderr)
+        _CONSOLE.print(f"[red]error:[/] file not found: {input_path}")
         sys.exit(1)
 
-    t_start = _time.perf_counter()
-    print(f"Analyzing  {input_path.name}")
-    print()
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        TimeElapsedColumn(),
+        TextColumn("{task.fields[note]}"),
+        console=_CONSOLE,
+    )
 
-    # ── Step 1: probe video properties ────────────────────────────────────────
-    step = _Step(1, "Probing video properties")
+    with Live(
+        Panel(progress, title=f"[bold blue]Analyzing[/]  {input_path.name}", border_style="blue"),
+        console=_CONSOLE,
+        refresh_rate=8,
+    ) as live:
 
-    def probe(entries: str, stream: str = "v:0") -> str:
-        r = subprocess.run([
-            "ffprobe", "-v", "error",
-            "-select_streams", stream,
-            "-show_entries", entries,
-            "-of", "csv=p=0",
-            str(input_path),
-        ], capture_output=True, text=True)
-        return r.stdout.strip()
+        def refresh(prog):
+            live.update(Panel(prog, title=f"[bold blue]Analyzing[/]  {input_path.name}",
+                              border_style="blue"))
 
-    try:
-        w, h  = probe("stream=width,height").split(",")
-        fps   = probe("stream=r_frame_rate")
-        codec = probe("stream=codec_name")
-        field = probe("stream=field_order")
-        dur   = float(subprocess.run([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(input_path),
-        ], capture_output=True, text=True).stdout.strip())
-    except Exception as e:
-        print(f"\nerror: could not probe video: {e}", file=sys.stderr)
-        sys.exit(1)
+        # ── Step 1: probe ─────────────────────────────────────────────────────
+        t1 = progress.add_task("Probing video properties", note="")
 
-    mins, secs = divmod(int(dur), 60)
-    hrs, mins  = divmod(mins, 60)
-    dur_str    = f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}"
-    interlaced = field not in ("progressive", "unknown", "")
-    step.done(f"{w}×{h}  {dur_str}  {'interlaced' if interlaced else 'progressive'}")
+        def probe(entries: str, stream: str = "v:0") -> str:
+            r = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", stream,
+                "-show_entries", entries, "-of", "csv=p=0", str(input_path),
+            ], capture_output=True, text=True)
+            return r.stdout.strip()
 
-    # ── Step 2: extract sample frame ──────────────────────────────────────────
-    import tempfile
-    step = _Step(2, "Extracting sample frame")
-    tmp_frame: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp_frame = Path(f.name)
+        try:
+            w, h  = probe("stream=width,height").split(",")
+            fps   = probe("stream=r_frame_rate")
+            codec = probe("stream=codec_name")
+            field = probe("stream=field_order")
+            dur   = float(subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(input_path),
+            ], capture_output=True, text=True).stdout.strip())
+        except Exception as e:
+            _CONSOLE.print(f"[red]error:[/] could not probe video: {e}")
+            sys.exit(1)
+
+        mins, secs = divmod(int(dur), 60)
+        hrs, mins  = divmod(mins, 60)
+        dur_str    = f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}"
+        interlaced = field not in ("progressive", "unknown", "")
+        progress.update(t1, completed=True, total=1,
+                        note=f"[dim]{w}×{h}  {dur_str}  {'interlaced' if interlaced else 'progressive'}[/]")
+        refresh(progress)
+
+        # ── Step 2: extract frame ─────────────────────────────────────────────
+        t2 = progress.add_task("Extracting sample frame", note="")
+        tmp_frame: Path | None = None
         mid_frame = int(dur / 2 * 25)
-        _extract_frame(input_path, tmp_frame, frame_n=mid_frame)
-        step.done(f"frame {mid_frame}")
-    except Exception as e:
-        step.skip(str(e))
-        tmp_frame = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                tmp_frame = Path(f.name)
+            _extract_frame(input_path, tmp_frame, frame_n=mid_frame)
+            progress.update(t2, completed=True, total=1,
+                            note=f"[dim]frame {mid_frame}[/]")
+        except Exception as e:
+            progress.update(t2, completed=True, total=1, note=f"[yellow]skipped ({e})[/]")
+            tmp_frame = None
+        refresh(progress)
 
-    # ── Step 3: noise measurement (BRISQUE) ───────────────────────────────────
-    step = _Step(3, "Measuring noise level (BRISQUE)")
-    noise_label = "unavailable"
-    noise_val: float | None = None
-    try:
-        import piq
-        from torchvision.io import read_image
-        if tmp_frame is None:
-            raise RuntimeError("no frame extracted")
-        img = read_image(str(tmp_frame)).float().div(255.0).unsqueeze(0)
-        noise_val = piq.brisque(img, data_range=1.0).item()
-        if noise_val < 20:
-            noise_label = f"{noise_val:.1f}  (clean)"
-            noise_note  = "clean"
-        elif noise_val < 40:
-            noise_label = f"{noise_val:.1f}  (moderate)"
-            noise_note  = "moderate"
-        else:
-            noise_label = f"{noise_val:.1f}  (noisy)"
-            noise_note  = "noisy"
-        step.done(noise_note)
-    except Exception as e:
-        step.skip(str(e))
-    finally:
-        if tmp_frame:
-            tmp_frame.unlink(missing_ok=True)
-
-    total_elapsed = _time.perf_counter() - t_start
-    print(f"\n  Done in {total_elapsed:.1f}s")
+        # ── Step 3: BRISQUE ───────────────────────────────────────────────────
+        t3 = progress.add_task("Measuring noise (BRISQUE)", note="")
+        noise_label = "unavailable"
+        noise_val: float | None = None
+        try:
+            import piq
+            from torchvision.io import read_image
+            if tmp_frame is None:
+                raise RuntimeError("no frame")
+            img = read_image(str(tmp_frame)).float().div(255.0).unsqueeze(0)
+            noise_val = piq.brisque(img, data_range=1.0).item()
+            if noise_val < 20:
+                noise_label = f"{noise_val:.1f}  (clean)"
+                note_markup = f"[green]{noise_label}[/]"
+            elif noise_val < 40:
+                noise_label = f"{noise_val:.1f}  (moderate)"
+                note_markup = f"[yellow]{noise_label}[/]"
+            else:
+                noise_label = f"{noise_val:.1f}  (noisy)"
+                note_markup = f"[red]{noise_label}[/]"
+            progress.update(t3, completed=True, total=1, note=note_markup)
+        except Exception as e:
+            progress.update(t3, completed=True, total=1, note=f"[yellow]skipped ({e})[/]")
+        finally:
+            if tmp_frame:
+                tmp_frame.unlink(missing_ok=True)
+        refresh(progress)
 
     # ── Results ───────────────────────────────────────────────────────────────
     knlm    = 0.8 if (noise_val or 0) < 20 else (2.0 if (noise_val or 0) >= 40 else 1.2)
@@ -909,27 +1182,32 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         f"  {skip_di}--knlm-h {knlm:.1f} --scale 2 --codec ffv1"
     )
 
-    sep = "─" * 52
-    print()
-    print(sep)
-    print(f"  File        {input_path.name}")
-    print(f"  Resolution  {w}×{h}  ({fps} fps)")
-    print(f"  Codec       {codec}")
-    print(f"  Duration    {dur_str}")
-    print(f"  Interlaced  {'yes' if interlaced else 'no'}  (field order: {field or 'unknown'})")
-    print(f"  Noise       {noise_label}")
-    print(sep)
-    print()
-    print("Profiles:")
+    info = Table(box=None, show_header=False, padding=(0, 2))
+    info.add_column(style="dim", width=14)
+    info.add_column()
+    info.add_row("File",        input_path.name)
+    info.add_row("Resolution",  f"{w}×{h}  ({fps} fps)")
+    info.add_row("Codec",       codec)
+    info.add_row("Duration",    dur_str)
+    info.add_row("Interlaced",  f"{'yes' if interlaced else 'no'}  ({field or 'unknown'})")
+    info.add_row("Noise",       noise_label)
+
+    profiles_table = Table(box=None, show_header=False, padding=(0, 2))
+    profiles_table.add_column(style="cyan", width=20)
+    profiles_table.add_column(style="dim")
     for name, prof in _PROFILES.items():
-        print(f"  --profile {name:<12}  {prof['desc']}")
-    print()
-    print("Suggested command:")
-    print(f"  {suggested}")
-    print()
+        profiles_table.add_row(f"--profile {name}", prof["desc"])
+
+    _CONSOLE.print()
+    _CONSOLE.print(Panel(info, title="[bold]Video Properties[/]", border_style="blue"))
+    _CONSOLE.print(Panel(profiles_table, title="[bold]Profiles[/]", border_style="dim"))
+    _CONSOLE.print(Panel(
+        f"[cyan]{suggested}[/]",
+        title="[bold]Suggested Command[/]",
+        border_style="dim",
+    ))
 
     if args.json:
-        import json as _json
         data = {
             "file": str(input_path),
             "width": int(w), "height": int(h),
@@ -940,7 +1218,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
             "brisque": round(noise_val, 2) if noise_val is not None else None,
             "suggested_command": suggested,
         }
-        print(_json.dumps(data, indent=2))
+        _CONSOLE.print_json(json.dumps(data))
 
 
 # ── Restore command ───────────────────────────────────────────────────────────

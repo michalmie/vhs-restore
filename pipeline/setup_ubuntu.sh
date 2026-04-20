@@ -344,8 +344,8 @@ ok "Real-ESRGAN → $REALESRGAN_DIR"
 # ── 8. Pipeline Python dependencies ───────────────────────────────────────────
 step 8 "Pipeline Python packages"
 
-pip install piq -q
-ok "piq (BRISQUE / NIQE quality metrics)"
+pip install piq rich -q
+ok "piq (quality metrics) + rich (TUI display)"
 
 
 # ── Final verification ────────────────────────────────────────────────────────
