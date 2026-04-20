@@ -80,11 +80,15 @@ fi
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 ok "GPU: $GPU_NAME"
 
-if command -v nvcc &>/dev/null; then
+# Detect CUDA version from driver (nvidia-smi) first, fall back to nvcc
+if command -v nvidia-smi &>/dev/null; then
+    CUDA_MAJOR=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9]+' | head -1)
+    ok "CUDA driver version: $(nvidia-smi | grep 'CUDA Version' | grep -oP 'CUDA Version: \K[0-9.]+')"
+elif command -v nvcc &>/dev/null; then
     CUDA_MAJOR=$(nvcc --version | grep -oP 'release \K[0-9]+' | head -1)
-    ok "CUDA: $(nvcc --version | grep release | awk '{print $6}' | tr -d ',')"
+    ok "CUDA toolkit: $(nvcc --version | grep release | awk '{print $6}' | tr -d ',')"
 else
-    warn "nvcc not found — CUDA toolkit not installed. Defaulting to cu118 PyTorch wheel."
+    warn "Neither nvidia-smi nor nvcc found — defaulting to cu118 PyTorch wheel."
     CUDA_MAJOR=11
 fi
 

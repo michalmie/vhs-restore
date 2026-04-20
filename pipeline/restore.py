@@ -384,6 +384,7 @@ def stage_upscale(input_path: Path, output_path: Path, cfg: Config, work_dir: Pa
     _run_live([
         "ffmpeg", "-y",
         "-i", str(input_path),
+        "-vf", "format=rgb24",  # force 8-bit before PNG encode (pix_fmt alone ignored for image2)
         str(frames_in / "frame_%08d.png"),
     ])
 
