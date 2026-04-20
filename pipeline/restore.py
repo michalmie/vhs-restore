@@ -925,7 +925,7 @@ class PipelineUI:
         self._stage_tasks: dict[int, TaskID] = {}
         self._gates: list[tuple[str, str, str]] = []  # (label, name, status_markup)
         self._lock = threading.Lock()
-        self._live = Live(self._render(), refresh_rate=8, console=_CONSOLE)
+        self._live = Live(self._render(), refresh_per_second=8, console=_CONSOLE)
 
     # ── context manager ───────────────────────────────────────────────────────
 
@@ -1093,7 +1093,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     with Live(
         Panel(progress, title=f"[bold blue]Analyzing[/]  {input_path.name}", border_style="blue"),
         console=_CONSOLE,
-        refresh_rate=8,
+        refresh_per_second=8,
     ) as live:
 
         def refresh(prog):
