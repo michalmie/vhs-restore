@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""
-VHS Post-Processing Pipeline with Quality Gates
-
-Stages:
-  1. VapourSynth  — QTGMC deinterlace + KNLMeansCL denoise + levels correction
-  2. Real-ESRGAN  — AI upscaling (GPU, tiled for 8GB VRAM)
-  3. Final encode — Film grain + FFV1/ProRes output
-
-Quality gates after each stage (BRISQUE, VMAF, NIQE).
-Produces a quality_report.json alongside the output file.
-
-Usage:
-  python restore.py input.mkv output.mkv
-  python restore.py input.mkv output.mkv --test          # 30-second sample
-  python restore.py input.mkv output.mkv --knlm-h 2.0   # aggressive denoise
-  python restore.py input.mkv output.mkv --keep-intermediates -v
-
-Requirements: see requirements.txt
-"""
+"""VHS digitization post-processing pipeline."""
 
 from __future__ import annotations
 
@@ -34,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 LOG = logging.getLogger("vhs")
+_VERBOSE = False  # set to True via --verbose; controls whether ffmpeg output is shown
 
 # ── Environment check ─────────────────────────────────────────────────────────
 _VENV = Path.home() / "vhs-env"
@@ -99,7 +82,9 @@ class Config:
     grain_strength: int = 4        # 1=subtle  4=natural  8=heavy
 
     # Output
-    output_codec: str = "ffv1"     # ffv1 (lossless archival) | prores (post-production)
+    output_codec: str = "ffv1"     # ffv1 | prores | h264 | h265
+    output_crf: int = 18           # quality for h264/h265 (0=lossless, 51=worst)
+    output_res: str = "native"     # native | 720p | 1080p | 4k | WxH
     keep_intermediates: bool = False
 
     # Quality gate thresholds
@@ -189,9 +174,17 @@ def _run(cmd: list[str | Path], **kwargs) -> subprocess.CompletedProcess:
 
 
 def _run_live(cmd: list[str | Path]) -> None:
-    """Run command streaming output to terminal (for long-running stages)."""
+    """Run a long-running command. Output shown only in --verbose mode; on failure always shown."""
     LOG.debug("$ %s", " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, check=True)
+    if _VERBOSE:
+        subprocess.run(cmd, check=True)
+        return
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        sys.stderr.buffer.write(result.stdout)
+        sys.stderr.buffer.write(result.stderr)
+        sys.stderr.flush()
+        raise subprocess.CalledProcessError(result.returncode, cmd)
 
 
 def _probe_duration(path: Path) -> float:
@@ -253,8 +246,38 @@ def _prores_flags() -> list[str]:
     return ["-c:v", "prores_ks", "-profile:v", "hq", "-pix_fmt", "yuv422p10le"]
 
 
+def _h264_flags(crf: int) -> list[str]:
+    return ["-c:v", "libx264", "-crf", str(crf), "-preset", "slow", "-pix_fmt", "yuv420p"]
+
+
+def _h265_flags(crf: int) -> list[str]:
+    return ["-c:v", "libx265", "-crf", str(crf), "-preset", "slow", "-pix_fmt", "yuv420p"]
+
+
 def _video_flags(cfg: Config) -> list[str]:
-    return _prores_flags() if cfg.output_codec == "prores" else _ffv1_flags()
+    if cfg.output_codec == "prores":
+        return _prores_flags()
+    if cfg.output_codec == "h264":
+        return _h264_flags(cfg.output_crf)
+    if cfg.output_codec == "h265":
+        return _h265_flags(cfg.output_crf)
+    return _ffv1_flags()
+
+
+_RES_MAP = {"720p": (1280, 720), "1080p": (1920, 1080), "4k": (3840, 2160)}
+
+
+def _output_res_filter(cfg: Config) -> str | None:
+    """Return a scale filter string for --output-res, or None if native."""
+    if cfg.output_res == "native":
+        return None
+    if cfg.output_res in _RES_MAP:
+        w, h = _RES_MAP[cfg.output_res]
+        return f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos"
+    if "x" in cfg.output_res:
+        w, h = cfg.output_res.split("x", 1)
+        return f"scale={w}:{h}:flags=lanczos"
+    return None
 
 
 # ── Stage 1: VapourSynth (deinterlace + denoise + color) ─────────────────────
@@ -427,7 +450,14 @@ def stage_final(
 ) -> None:
     LOG.info("[Stage 3] Film grain (strength=%d) + final encode (%s)", cfg.grain_strength, cfg.output_codec)
 
-    grain_filter = f"noise=alls={cfg.grain_strength}:allf=t+u"
+    filters = []
+    res_filter = _output_res_filter(cfg)
+    if res_filter:
+        filters.append(res_filter)
+    if cfg.grain_strength > 0:
+        filters.append(f"noise=alls={cfg.grain_strength}:allf=t+u")
+
+    audio_codec = "aac" if cfg.output_codec in ("h264", "h265") else "flac"
 
     _run_live([
         "ffmpeg", "-y",
@@ -435,9 +465,9 @@ def stage_final(
         "-i", str(audio_source),
         "-map", "0:v",
         "-map", "1:a",
-        "-vf", grain_filter,
+        *(["-vf", ",".join(filters)] if filters else []),
         *_video_flags(cfg),
-        "-c:a", "flac",
+        "-c:a", audio_codec,
         str(output_path),
     ])
 
@@ -624,10 +654,13 @@ def _log_gate(gate: dict) -> None:
 # ── Pipeline orchestration ────────────────────────────────────────────────────
 
 def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
-    # FFV1 and ProRes require MKV; silently fix .mp4 output paths
-    if output_path.suffix.lower() == ".mp4" and cfg.output_codec in ("ffv1", "prores"):
+    # Enforce correct container: FFV1/ProRes → .mkv, h264/h265 → .mp4
+    if cfg.output_codec in ("ffv1", "prores") and output_path.suffix.lower() != ".mkv":
         output_path = output_path.with_suffix(".mkv")
-        LOG.warning("Output renamed to %s — FFV1/ProRes not supported in MP4 container", output_path)
+        LOG.warning("Output renamed to %s — FFV1/ProRes require MKV container", output_path)
+    elif cfg.output_codec in ("h264", "h265") and output_path.suffix.lower() not in (".mp4", ".mkv"):
+        output_path = output_path.with_suffix(".mp4")
+        LOG.warning("Output renamed to %s", output_path)
 
     work_dir = output_path.parent / f".vhs_work_{output_path.stem}"
     work_dir.mkdir(exist_ok=True)
@@ -726,87 +759,316 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             LOG.info("Intermediates kept at: %s", work_dir)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── Profiles ──────────────────────────────────────────────────────────────────
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="VHS post-processing pipeline (deinterlace → denoise → upscale → grain)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+_PROFILES: dict[str, dict] = {
+    "archival": {
+        "output_codec": "ffv1",
+        "realesrgan_scale": 2,
+        "grain_strength": 4,
+        "qtgmc_preset": "Slower",
+        "desc": "Lossless FFV1/MKV, 2× upscale — best quality, large files",
+    },
+    "streaming": {
+        "output_codec": "h264",
+        "output_crf": 18,
+        "realesrgan_scale": 2,
+        "grain_strength": 2,
+        "qtgmc_preset": "Slow",
+        "desc": "H.264/MP4 CRF 18, 2× upscale — good quality, shareable files",
+    },
+    "preview": {
+        "output_codec": "h264",
+        "output_crf": 28,
+        "realesrgan_scale": 1,
+        "grain_strength": 0,
+        "qtgmc_preset": "Fast",
+        "desc": "H.264/MP4 CRF 28, no upscale — fast preview, small files",
+    },
+}
+
+
+# ── Analyze command ───────────────────────────────────────────────────────────
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    input_path = args.input.resolve()
+    if not input_path.exists():
+        print(f"error: file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Analyzing {input_path.name}...")
+
+    # Probe video properties
+    def probe(entries: str, stream: str = "v:0") -> str:
+        r = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", stream,
+            "-show_entries", entries,
+            "-of", "csv=p=0",
+            str(input_path),
+        ], capture_output=True, text=True)
+        return r.stdout.strip()
+
+    try:
+        w, h = probe("stream=width,height").split(",")
+        fps   = probe("stream=r_frame_rate")
+        codec = probe("stream=codec_name")
+        field = probe("stream=field_order")
+        dur   = float(subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(input_path),
+        ], capture_output=True, text=True).stdout.strip())
+    except Exception as e:
+        print(f"error: could not probe video: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    mins, secs = divmod(int(dur), 60)
+    hrs, mins  = divmod(mins, 60)
+    dur_str    = f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}"
+    interlaced = field not in ("progressive", "unknown", "")
+
+    # Sample a frame for BRISQUE noise estimate
+    noise_label = "unknown"
+    noise_val   = None
+    try:
+        import tempfile, piq
+        from torchvision.io import read_image
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            tmp = Path(f.name)
+        mid = int(dur / 2 * 25)
+        _extract_frame(input_path, tmp, frame_n=mid)
+        img = read_image(str(tmp)).float().div(255.0).unsqueeze(0)
+        noise_val = piq.brisque(img, data_range=1.0).item()
+        tmp.unlink(missing_ok=True)
+        if noise_val < 20:
+            noise_label = f"{noise_val:.1f}  (clean)"
+        elif noise_val < 40:
+            noise_label = f"{noise_val:.1f}  (moderate — denoising recommended)"
+        else:
+            noise_label = f"{noise_val:.1f}  (noisy — strong denoising recommended)"
+    except Exception:
+        noise_label = "unavailable (piq not installed)"
+
+    # Build suggested command
+    knlm = 0.8 if (noise_val or 0) < 20 else (2.0 if (noise_val or 0) >= 40 else 1.2)
+    skip_di = "--skip-deinterlace " if not interlaced else ""
+    suggested = (
+        f"python pipeline/restore.py restore {input_path.name} output.mkv \\\n"
+        f"  {skip_di}--knlm-h {knlm:.1f} --scale 2 --codec ffv1"
     )
-    p.add_argument("input",  type=Path, help="Captured VHS .mkv file")
-    p.add_argument("output", type=Path, help="Output file path")
+
+    # Output
+    sep = "─" * 48
+    print(sep)
+    print(f"  File       {input_path.name}")
+    print(f"  Resolution {w}×{h}  {fps} fps")
+    print(f"  Codec      {codec}")
+    print(f"  Duration   {dur_str}")
+    print(f"  Interlaced {interlaced}  (field order: {field or 'unknown'})")
+    print(f"  Noise      {noise_label}")
+    print(sep)
+    print()
+    print("Profiles:")
+    for name, p in _PROFILES.items():
+        print(f"  --profile {name:<12}  {p['desc']}")
+    print()
+    print("Suggested command:")
+    print(f"  {suggested}")
+    print()
+
+    if args.json:
+        import json as _json
+        data = {
+            "file": str(input_path),
+            "width": int(w), "height": int(h),
+            "fps": fps, "codec": codec,
+            "duration_sec": dur,
+            "interlaced": interlaced,
+            "field_order": field,
+            "brisque": round(noise_val, 2) if noise_val is not None else None,
+            "suggested_command": suggested,
+        }
+        print(_json.dumps(data, indent=2))
+
+
+# ── Restore command ───────────────────────────────────────────────────────────
+
+def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    p = sub.add_parser(
+        "restore",
+        help="Run the full restoration pipeline",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=textwrap.dedent("""\
+            profiles (--profile overrides individual flags):
+              archival   FFV1/MKV lossless, 2× upscale, grain=4
+              streaming  H.264/MP4 CRF 18, 2× upscale, grain=2
+              preview    H.264/MP4 CRF 28, no upscale, fast preset
+
+            examples:
+              %(prog)s capture.mkv output.mkv
+              %(prog)s capture.mkv output.mp4 --profile streaming
+              %(prog)s capture.mkv output.mkv --codec h265 --crf 22 --output-res 1080p
+              %(prog)s capture.mkv preview.mp4 --profile preview --test --test-sample
+        """),
+    )
+    p.add_argument("input",  type=Path, help="Source video file")
+    p.add_argument("output", type=Path, help="Output file (.mkv for ffv1/prores, .mp4 for h264/h265)")
+
+    p.add_argument("--profile", choices=list(_PROFILES), metavar="PROFILE",
+                   help=f"Preset: {', '.join(_PROFILES)}")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print resolved config without processing")
+
+    g = p.add_argument_group("Output format")
+    g.add_argument("--codec", dest="output_codec", default="ffv1",
+                   choices=["ffv1", "prores", "h264", "h265"],
+                   help="Video codec")
+    g.add_argument("--crf", type=int, default=18, dest="output_crf",
+                   metavar="0-51",
+                   help="Quality for h264/h265 (lower = better; 18=high, 28=medium)")
+    g.add_argument("--output-res", default="native", dest="output_res",
+                   metavar="RES",
+                   help="Downscale after upscaling: native | 720p | 1080p | 4k | WxH")
+    g.add_argument("--grain", type=int, default=4, dest="grain_strength",
+                   metavar="0-10",
+                   help="Film grain synthesis strength (0 = off)")
+    g.add_argument("--keep-intermediates", action="store_true")
 
     g = p.add_argument_group("Deinterlacing")
     g.add_argument("--qtgmc-preset", default="Slower",
                    choices=["Draft", "Fast", "Medium", "Slow", "Slower", "Placebo"])
     g.add_argument("--skip-deinterlace", action="store_true",
-                   help="Skip QTGMC — use when source is already progressive (OBS MP4)")
+                   help="Skip QTGMC — source is already progressive (e.g. OBS capture)")
 
     g = p.add_argument_group("Denoising")
-    g.add_argument("--knlm-h",   type=float, default=1.2,  help="Denoise strength (0.8–2.0)")
-    g.add_argument("--knlm-d",   type=int,   default=1,    help="Temporal radius in frames")
-    g.add_argument("--gpu",      type=int,   default=0,    dest="gpu_device_id")
+    g.add_argument("--knlm-h", type=float, default=1.2, metavar="STRENGTH",
+                   help="Denoise strength: 0.8=light, 1.2=balanced, 2.0=aggressive")
+    g.add_argument("--knlm-d", type=int, default=1,
+                   help="Temporal radius in frames")
+    g.add_argument("--gpu", type=int, default=0, dest="gpu_device_id")
 
     g = p.add_argument_group("Color correction")
-    g.add_argument("--levels-min-in", type=int, default=16,  help="Black point")
-    g.add_argument("--levels-max-in", type=int, default=235, help="White point")
+    g.add_argument("--levels-min-in", type=int, default=16, help="Black point (VHS default: 16)")
+    g.add_argument("--levels-max-in", type=int, default=235, help="White point (VHS default: 235)")
 
-    g = p.add_argument_group("Upscaling (Real-ESRGAN)")
-    g.add_argument("--realesrgan-model", default="realesr-general-x4v3",
-                   choices=["realesr-general-x4v3", "RealESRGAN_x4plus", "RealESRGAN_x4plus-anime"])
-    g.add_argument("--realesrgan-scale", type=int,  default=2,    choices=[2, 4])
-    g.add_argument("--realesrgan-tile",  type=int,  default=256,  help="0 = disable tiling")
-    g.add_argument("--realesrgan-dir",   default="~/Real-ESRGAN", help="Path to cloned repo")
-
-    g = p.add_argument_group("Output")
-    g.add_argument("--grain",  type=int, default=4,     dest="grain_strength", help="Film grain 1–8")
-    g.add_argument("--codec",  default="ffv1",          dest="output_codec",   choices=["ffv1", "prores"])
-    g.add_argument("--keep-intermediates", action="store_true")
-
-    g = p.add_argument_group("Quality gate thresholds")
-    g.add_argument("--gate-progressive-pct", type=float, default=0.95, dest="gate_min_progressive_pct",
-                   help="Min progressive frames after deinterlace")
-    g.add_argument("--gate-brisque-delta",   type=float, default=5.0,  dest="gate_max_brisque_delta",
-                   help="Max BRISQUE increase after denoise")
-    g.add_argument("--gate-vmaf",            type=float, default=65.0, dest="gate_min_vmaf",
-                   help="Min VMAF vs bicubic after upscale")
-    g.add_argument("--gate-niqe",            type=float, default=6.0,  dest="gate_max_niqe",
-                   help="Max NIQE on final output")
+    g = p.add_argument_group("Upscaling")
+    g.add_argument("--scale", type=int, default=2, choices=[1, 2, 4],
+                   dest="realesrgan_scale",
+                   help="AI upscale factor (1 = skip upscaling)")
+    g.add_argument("--model", default="realesr-general-x4v3",
+                   choices=["realesr-general-x4v3", "RealESRGAN_x4plus"],
+                   dest="realesrgan_model")
+    g.add_argument("--tile", type=int, default=256, dest="realesrgan_tile",
+                   help="Tile size for VRAM-limited GPUs (0 = disable)")
+    g.add_argument("--realesrgan-dir", default="~/Real-ESRGAN",
+                   help="Path to cloned Real-ESRGAN repo")
 
     g = p.add_argument_group("Test mode")
-    g.add_argument("--test",           action="store_true", dest="test_mode",
-                   help="Process 30-second sample clip only")
-    g.add_argument("--test-sample",    action="store_true", dest="test_sample",
-                   help="Auto-pick clip from middle of video (probes duration, overrides --test-start)")
-    g.add_argument("--test-start",     default="00:05:00",  help="Clip start time HH:MM:SS (ignored when --test-sample is set)")
-    g.add_argument("--test-duration",  type=int, default=30, help="Clip length in seconds")
+    g.add_argument("--test", action="store_true", dest="test_mode",
+                   help="Process a short sample clip instead of the full video")
+    g.add_argument("--test-sample", action="store_true",
+                   help="Pick the sample clip from the middle of the video")
+    g.add_argument("--test-start", default="00:05:00",
+                   help="Sample start time HH:MM:SS (overridden by --test-sample)")
+    g.add_argument("--test-duration", type=int, default=30,
+                   help="Sample length in seconds")
 
-    p.add_argument("-v", "--verbose", action="store_true")
+    g = p.add_argument_group("Quality gate thresholds")
+    g.add_argument("--gate-progressive-pct", type=float, default=0.95,
+                   dest="gate_min_progressive_pct")
+    g.add_argument("--gate-brisque-delta", type=float, default=5.0,
+                   dest="gate_max_brisque_delta")
+    g.add_argument("--gate-ssim", type=float, default=65.0, dest="gate_min_vmaf")
+    g.add_argument("--gate-niqe", type=float, default=6.0, dest="gate_max_niqe")
+
     return p
 
 
+def cmd_restore(args: argparse.Namespace) -> None:
+    input_path  = args.input.resolve()
+    output_path = args.output.resolve()
+
+    if not input_path.exists():
+        print(f"error: input file not found: {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    skip = {"input", "output", "verbose", "profile", "dry_run", "subcommand"}
+    cfg_kwargs = {k: v for k, v in vars(args).items() if k not in skip}
+
+    # Profile sets defaults; any explicitly passed flag wins over the profile
+    if args.profile:
+        profile_vals = {k: v for k, v in _PROFILES[args.profile].items() if k != "desc"}
+        cfg_defaults = asdict(Config())
+        # A key is "explicitly set" when it differs from the Config dataclass default
+        overridden = {k for k, v in cfg_kwargs.items() if v != cfg_defaults.get(k)}
+        cfg_kwargs = {**profile_vals, **{k: v for k, v in cfg_kwargs.items() if k in overridden}}
+
+    cfg = Config(**cfg_kwargs)
+
+    if args.dry_run:
+        print("Resolved configuration:")
+        for k, v in asdict(cfg).items():
+            print(f"  {k:<30} {v}")
+        print(f"\nInput:   {input_path}")
+        print(f"Output:  {output_path}")
+        return
+
+    run_pipeline(input_path, output_path, cfg)
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
 def main() -> None:
-    _check_env()
-    parser = _build_parser()
-    args = parser.parse_args()
+    global _VERBOSE
+
+    p = argparse.ArgumentParser(
+        prog="restore.py",
+        description="VHS digitization post-processing pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            commands:
+              analyze   Probe a video file and print recommended restore settings
+              restore   Run the full pipeline (deinterlace → denoise → upscale → grain)
+
+            quick start:
+              python pipeline/restore.py analyze capture.mp4
+              python pipeline/restore.py restore capture.mp4 output.mkv
+              python pipeline/restore.py restore capture.mp4 output.mp4 --profile streaming
+        """),
+    )
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Show full ffmpeg output during processing")
+    sub = p.add_subparsers(dest="subcommand")
+
+    # analyze subcommand
+    ap = sub.add_parser("analyze", help="Probe video and print recommended settings",
+                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    ap.add_argument("input", type=Path, help="Video file to analyze")
+    ap.add_argument("--json", action="store_true", help="Output results as JSON")
+
+    # restore subcommand
+    _restore_parser(sub)
+
+    args = p.parse_args()
+
+    if args.subcommand is None:
+        p.print_help()
+        sys.exit(0)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%H:%M:%S",
     )
+    _VERBOSE = args.verbose
 
-    input_path  = args.input.resolve()
-    output_path = args.output.resolve()
-
-    if not input_path.exists():
-        parser.error(f"Input file not found: {input_path}")
-
-    skip = {"input", "output", "verbose"}
-    cfg_kwargs = {k: v for k, v in vars(args).items() if k not in skip}
-    cfg = Config(**cfg_kwargs)
-
-    run_pipeline(input_path, output_path, cfg)
+    if args.subcommand == "analyze":
+        cmd_analyze(args)
+    elif args.subcommand == "restore":
+        _check_env()
+        cmd_restore(args)
 
 
 if __name__ == "__main__":
