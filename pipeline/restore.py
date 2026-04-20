@@ -1346,6 +1346,127 @@ def cmd_restore(args: argparse.Namespace) -> None:
     run_pipeline(input_path, output_path, cfg)
 
 
+# ── Trim command ──────────────────────────────────────────────────────────────
+
+def cmd_trim(args: argparse.Namespace) -> None:
+    input_path  = args.input.resolve()
+    output_path = args.output.resolve() if args.output else None
+
+    if not input_path.exists():
+        _CONSOLE.print(f"[red]error:[/] file not found: {input_path}")
+        sys.exit(1)
+
+    dur = _probe_duration(input_path)
+
+    _CONSOLE.print()
+
+    with _CONSOLE.status("[bold]Detecting black frames…[/]"):
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", str(input_path),
+                "-vf", f"blackdetect=d={args.min_duration}:pix_th={args.threshold}",
+                "-f", "null", "-",
+            ],
+            capture_output=True, text=True,
+        )
+        raw = result.stderr
+
+    # Parse blackdetect output
+    intervals = []
+    for m in re.finditer(
+        r"black_start:([\d.]+)\s+black_end:([\d.]+)\s+black_duration:([\d.]+)", raw
+    ):
+        intervals.append((float(m.group(1)), float(m.group(2)), float(m.group(3))))
+
+    if not intervals:
+        _CONSOLE.print(Panel(
+            "[green]No black screens detected.[/]  Nothing to trim.",
+            border_style="green",
+        ))
+        return
+
+    # Determine content window (skip leading/trailing black)
+    content_start = 0.0
+    content_end   = dur
+
+    if intervals[0][0] < 0.5:          # black at beginning
+        content_start = intervals[0][1]
+        intervals = intervals[1:]
+
+    if intervals and intervals[-1][1] >= dur - 0.5:   # black at end
+        content_end = intervals[-1][0]
+        intervals   = intervals[:-1]
+
+    # Build results table
+    table = Table(title="Detected Black Regions", border_style="blue")
+    table.add_column("Start",    style="cyan",  width=12)
+    table.add_column("End",      style="cyan",  width=12)
+    table.add_column("Duration", style="yellow", width=10)
+    table.add_column("Position", style="dim",   width=16)
+
+    def fmt_ts(s: float) -> str:
+        m, sec = divmod(s, 60)
+        return f"{int(m):02d}:{sec:05.2f}"
+
+    def position_label(start: float, end: float) -> str:
+        if start < 0.5:
+            return "▶ leading"
+        if end >= dur - 0.5:
+            return "◀ trailing"
+        return "middle"
+
+    # Re-parse all for display
+    all_intervals = []
+    for m2 in re.finditer(
+        r"black_start:([\d.]+)\s+black_end:([\d.]+)\s+black_duration:([\d.]+)", raw
+    ):
+        s, e, d = float(m2.group(1)), float(m2.group(2)), float(m2.group(3))
+        all_intervals.append((s, e, d))
+
+    for s, e, d in all_intervals:
+        label = position_label(s, e)
+        style = "" if "middle" in label else "bold"
+        table.add_row(fmt_ts(s), fmt_ts(e), f"{d:.2f}s", label, style=style)
+
+    trimmed_dur = content_end - content_start
+    summary = Table(box=None, show_header=False, padding=(0, 2))
+    summary.add_column(style="dim", width=16)
+    summary.add_column()
+    summary.add_row("Original",      f"{fmt_ts(dur)}  ({dur:.1f}s)")
+    summary.add_row("Content start", fmt_ts(content_start))
+    summary.add_row("Content end",   fmt_ts(content_end))
+    summary.add_row("Trimmed",       f"[green]{fmt_ts(trimmed_dur)}  ({trimmed_dur:.1f}s)[/]")
+    summary.add_row("Removed",       f"[yellow]{dur - trimmed_dur:.1f}s[/]")
+
+    _CONSOLE.print(table)
+    _CONSOLE.print()
+    _CONSOLE.print(Panel(summary, title="[bold]Trim Summary[/]", border_style="blue"))
+
+    if args.dry_run:
+        _CONSOLE.print("\n[dim]--dry-run: no output written[/]")
+        return
+
+    if output_path is None:
+        stem = input_path.stem + "_trimmed"
+        output_path = input_path.with_name(stem + input_path.suffix)
+
+    _CONSOLE.print(f"\nWriting [cyan]{output_path.name}[/]…")
+    with _CONSOLE.status("Trimming…"):
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-ss", str(content_start),
+            "-to", str(content_end),
+            "-i", str(input_path),
+            "-c", "copy",
+            str(output_path),
+        ], capture_output=True, check=True)
+
+    _CONSOLE.print(Panel(
+        f"[green]✓[/]  {output_path.name}  ({trimmed_dur:.1f}s)",
+        border_style="green",
+    ))
+
+
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1358,12 +1479,15 @@ def main() -> None:
         epilog=textwrap.dedent("""\
             commands:
               analyze   Probe a video file and print recommended restore settings
+              trim      Remove leading/trailing black screens from a capture
               restore   Run the full pipeline (deinterlace → denoise → upscale → grain)
 
             quick start:
               python pipeline/restore.py analyze capture.mp4
+              python pipeline/restore.py trim capture.mp4
               python pipeline/restore.py restore capture.mp4 output.mkv
               python pipeline/restore.py restore capture.mp4 output.mp4 --profile streaming
+              python pipeline/restore.py restore capture.mp4 out.mkv --test --test-sample
         """),
     )
     p.add_argument("-v", "--verbose", action="store_true",
@@ -1375,6 +1499,30 @@ def main() -> None:
                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("input", type=Path, help="Video file to analyze")
     ap.add_argument("--json", action="store_true", help="Output results as JSON")
+
+    # trim subcommand
+    tp = sub.add_parser(
+        "trim",
+        help="Remove leading/trailing black screens",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              %(prog)s capture.mp4                     # auto-name output *_trimmed.mp4
+              %(prog)s capture.mp4 clean.mp4           # explicit output path
+              %(prog)s capture.mp4 --dry-run           # show what would be trimmed
+              %(prog)s capture.mp4 --min-duration 2.0  # only remove blacks ≥ 2s
+        """),
+    )
+    tp.add_argument("input",  type=Path, help="Source video file")
+    tp.add_argument("output", type=Path, nargs="?", default=None,
+                    help="Output path (default: <input>_trimmed.<ext>)")
+    tp.add_argument("--threshold",    type=float, default=0.1,  metavar="0-1",
+                    help="Pixel brightness threshold for black detection")
+    tp.add_argument("--min-duration", type=float, default=0.5,  dest="min_duration",
+                    metavar="SEC",
+                    help="Minimum black region duration to consider")
+    tp.add_argument("--dry-run", action="store_true",
+                    help="Show detected regions without writing output")
 
     # restore subcommand
     _restore_parser(sub)
@@ -1394,6 +1542,8 @@ def main() -> None:
 
     if args.subcommand == "analyze":
         cmd_analyze(args)
+    elif args.subcommand == "trim":
+        cmd_trim(args)
     elif args.subcommand == "restore":
         _check_env()
         cmd_restore(args)
