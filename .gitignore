@@ -1,0 +1,31 @@
+# Secrets and credentials
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+*credentials*
+*secrets*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Pipeline work directories and output
+.vhs_work_*/
+*.quality_report.json
+
+# Model weights (large binaries — download via setup script)
+*.pth
+*.pt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
