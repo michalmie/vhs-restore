@@ -270,11 +270,65 @@ def detect_field_order(path: Path) -> str:
     return r.stdout.strip() or "unknown"
 
 
+def _vs_plugins_available() -> bool:
+    """Return True if ffms2 and knlm are both loaded in VapourSynth core."""
+    try:
+        import vapoursynth as vs  # type: ignore
+        core = vs.core
+        return hasattr(core, "ffms2") and hasattr(core, "knlm")
+    except Exception:
+        return False
+
+
+def _stage_vs_ffmpeg(input_path: Path, output_path: Path, cfg: Config) -> None:
+    """Stage 1 fallback using ffmpeg filters (progressive sources only).
+
+    Used when VapourSynth plugins (ffms2, KNLMeansCL) are not installed.
+    hqdn3d approximates temporal+spatial denoising; colorlevels maps VHS
+    video-range (16-235) to full range.
+    """
+    LOG.warning(
+        "VapourSynth plugins (ffms2 / KNLMeansCL) not installed — "
+        "using ffmpeg hqdn3d fallback for Stage 1.  "
+        "Run bash pipeline/setup_ubuntu.sh to install full plugin stack."
+    )
+
+    # Map knlm_h (0.8–2.0) to hqdn3d luma_spatial (2–6)
+    luma = max(1.0, cfg.knlm_h * 3.0)
+    filters = [f"hqdn3d={luma:.1f}:{luma*0.75:.1f}:{luma*1.5:.1f}:{luma:.1f}"]
+
+    lo = cfg.levels_min_in / 255.0
+    hi = cfg.levels_max_in / 255.0
+    if lo > 0.001 or hi < 0.999:
+        filters.append(
+            f"colorlevels=rimin={lo:.4f}:rimax={hi:.4f}"
+            f":gimin={lo:.4f}:gimax={hi:.4f}"
+            f":bimin={lo:.4f}:bimax={hi:.4f}"
+        )
+
+    cmd = (
+        ["ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters)]
+        + _ffv1_flags()
+        + [str(output_path)]
+    )
+    _run_live(cmd)
+    LOG.info("  Stage 1 complete (ffmpeg fallback) → %s", output_path)
+
+
 def stage_vs(input_path: Path, output_path: Path, cfg: Config, work_dir: Path) -> None:
     if cfg.skip_deinterlace:
         LOG.info("[Stage 1] Denoise + Color correction (deinterlace skipped — progressive source)")
+        # Use ffmpeg fallback when VapourSynth plugins are missing (progressive only)
+        if not _vs_plugins_available():
+            _stage_vs_ffmpeg(input_path, output_path, cfg)
+            return
         template = _VS_TEMPLATE_PROGRESSIVE
     else:
+        if not _vs_plugins_available():
+            raise RuntimeError(
+                "VapourSynth plugins (ffms2, KNLMeansCL) are required for interlaced sources. "
+                "Run bash pipeline/setup_ubuntu.sh to install them."
+            )
         LOG.info("[Stage 1] Deinterlace + Denoise + Color correction (VapourSynth)")
         template = _VS_TEMPLATE_INTERLACED
 
