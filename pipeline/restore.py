@@ -630,6 +630,11 @@ def _log_gate(gate: dict) -> None:
 # ── Pipeline orchestration ────────────────────────────────────────────────────
 
 def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
+    # FFV1 and ProRes require MKV; silently fix .mp4 output paths
+    if output_path.suffix.lower() == ".mp4" and cfg.output_codec in ("ffv1", "prores"):
+        output_path = output_path.with_suffix(".mkv")
+        LOG.warning("Output renamed to %s — FFV1/ProRes not supported in MP4 container", output_path)
+
     work_dir = output_path.parent / f".vhs_work_{output_path.stem}"
     work_dir.mkdir(exist_ok=True)
     LOG.info("Work dir: %s", work_dir)
