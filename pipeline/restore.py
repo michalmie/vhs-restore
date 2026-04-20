@@ -928,9 +928,9 @@ def run_pipeline(input_path: Path, output_path: Path, cfg: Config) -> dict:
             input_path = clip
             audio_source = clip
 
-        # Test mode: skip upscaling, output only the side-by-side comparison
+        # Test mode: output only the side-by-side comparison
+        # Upscaling still runs unless user explicitly passes --scale 1
         if cfg.test_mode:
-            cfg.realesrgan_scale = 1
             cfg.compare = True
 
         # Auto-detect field order if not explicitly set
