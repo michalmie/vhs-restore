@@ -216,15 +216,14 @@ else
         warn "ffms2: git clone failed"
     else
         cd "$FFMS2_SRC"
-        # Find jellyfin pkg-config dir (usually lib/pkgconfig inside the jellyfin prefix)
-        JFFMPEG_PKG=$(find "$JFFMPEG" -name "libavformat.pc" 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "")
-        if [ -n "$JFFMPEG_PKG" ]; then
-            export PKG_CONFIG_PATH="$JFFMPEG_PKG:$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-        fi
+        # jellyfin-ffmpeg7 does not ship .pc files — bypass pkg-config entirely using
+        # FFMPEG_CFLAGS/FFMPEG_LIBS as suggested by the configure script itself
         # Run all build steps in one if-chain so set -e doesn't kill the script on failure
         if ./autogen.sh >> "$FFMS2_LOG" 2>&1 \
-           && CPPFLAGS="-I${JFFMPEG}/include" \
-              LDFLAGS="-L${JFFMPEG}/lib -Wl,-rpath,${JFFMPEG}/lib" \
+           && PKG_CONFIG_PATH="$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+              FFMPEG_CFLAGS="-I${JFFMPEG}/include" \
+              FFMPEG_LIBS="-L${JFFMPEG}/lib -lavformat -lavcodec -lswscale -lavutil -lswresample" \
+              LDFLAGS="-Wl,-rpath,${JFFMPEG}/lib" \
               ./configure --prefix=/usr/local --with-vapoursynth >> "$FFMS2_LOG" 2>&1 \
            && make -j"$(nproc)" >> "$FFMS2_LOG" 2>&1; then
             # autotools puts the VS plugin .so in src/vapoursynth/.libs/
@@ -274,10 +273,12 @@ _build_meson_plugin() {
 }
 
 # mvtools — motion compensation, required by QTGMC
-_build_meson_plugin mvtools "https://github.com/dubhater/vapoursynth-mvtools" "libmvtools.so"
+# meson shared_module() produces mvtools.so (no lib prefix) on Linux
+_build_meson_plugin mvtools "https://github.com/dubhater/vapoursynth-mvtools" "mvtools.so"
 
 # KNLMeansCL — GPU denoising via OpenCL
-_build_meson_plugin knlm   "https://github.com/Khanattila/KNLMeansCL"        "libKNLMeansCL.so"
+# meson shared_module() produces KNLMeansCL.so (no lib prefix) on Linux
+_build_meson_plugin knlm   "https://github.com/Khanattila/KNLMeansCL"        "KNLMeansCL.so"
 
 
 # ── 7. PyTorch + Real-ESRGAN ─────────────────────────────────────────────────
