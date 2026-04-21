@@ -1065,6 +1065,7 @@ def make_comparison(
     processed: Path,
     output: Path,
     on_progress: Callable[[str, int, int], None] | None = None,
+    right_label: str = "RESTORED",
 ) -> None:
     """Render original (left) vs restored (right) side-by-side as H.264 MP4.
 
@@ -1074,14 +1075,18 @@ def make_comparison(
     w, h = _probe_dimensions(processed)
     total = _probe_frame_count(processed)
 
+    font_size = max(18, h // 30)
+    # Escape single quotes for ffmpeg drawtext
+    right_label_esc = right_label.replace("'", "\\'")
+
     # Scale original to match processed dimensions (bicubic, same as baseline)
-    # Then hstack with the processed video; burn "ORIGINAL" / "RESTORED" labels.
+    # Then hstack with the processed video; burn labels into each half.
     filter_complex = (
         f"[0:v]scale={w}:{h}:flags=lanczos,"
-        f"drawtext=text='ORIGINAL':fontsize={max(18, h//30)}:fontcolor=white"
+        f"drawtext=text='ORIGINAL':fontsize={font_size}:fontcolor=white"
         f":shadowcolor=black:shadowx=2:shadowy=2:x=20:y=20[left];"
         f"[1:v]scale={w}:{h}:flags=lanczos,"
-        f"drawtext=text='RESTORED':fontsize={max(18, h//30)}:fontcolor=white"
+        f"drawtext=text='{right_label_esc}':fontsize={font_size}:fontcolor=white"
         f":shadowcolor=black:shadowx=2:shadowy=2:x=20:y=20[right];"
         "[left][right]hstack=inputs=2[out]"
     )
@@ -1799,9 +1804,11 @@ def cmd_enhance(args: argparse.Namespace) -> None:
                         progress.update(tid2, completed=int(m.group(1)), total=total)
                         _refresh()
 
-                make_comparison(source, enhanced, output_path, on_progress=lambda s, d, t: (
-                    progress.update(tid2, completed=d, total=t), _refresh()
-                ))
+                make_comparison(source, enhanced, output_path,
+                               on_progress=lambda s, d, t: (
+                                   progress.update(tid2, completed=d, total=t), _refresh()
+                               ),
+                               right_label=applied)
                 progress.update(tid2, completed=total or 1, total=total or 1,
                                 description="[green]Done[/]  ✓")
 
