@@ -1657,22 +1657,43 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
 # ── Enhance command ───────────────────────────────────────────────────────────
 
-def _build_enhance_filters(args: argparse.Namespace) -> list[str]:
-    """Build ffmpeg filter chain from enhance args. Order matches the full pipeline."""
+def _build_enhance_filters(args: argparse.Namespace) -> list[tuple[str, str, str]]:
+    """Return list of (label, detail, ffmpeg_filter) for each active effect."""
     f = []
     if args.balance_brightness:
-        f.append("normalize=blackpt=black:whitept=white:smoothing=5")
+        f.append((
+            "balance-brightness",
+            "auto-normalize histogram",
+            "normalize=blackpt=black:whitept=white:smoothing=5",
+        ))
     if args.warmth != 0.0:
         w = args.warmth * 0.15
         rr = round(max(0.5, min(1.5, 1.0 + w)), 3)
         bb = round(max(0.5, min(1.5, 1.0 - w)), 3)
-        f.append(f"colorchannelmixer=rr={rr}:bb={bb}")
+        direction = "warmer (boost R, reduce B)" if args.warmth > 0 else "cooler (boost B, reduce R)"
+        f.append((
+            f"warmth {args.warmth:+.1f}",
+            f"{direction}  →  R×{rr}  B×{bb}",
+            f"colorchannelmixer=rr={rr}:bb={bb}",
+        ))
     if args.saturation != 1.0:
-        f.append(f"eq=saturation={args.saturation:.2f}")
+        f.append((
+            f"saturation ×{args.saturation:.2f}",
+            "boost" if args.saturation > 1 else "reduce",
+            f"eq=saturation={args.saturation:.2f}",
+        ))
     if args.cas:
-        f.append(f"cas=strength={args.cas_strength:.2f}")
+        f.append((
+            f"CAS strength={args.cas_strength:.2f}",
+            "contrast-adaptive sharpening (gentle)",
+            f"cas=strength={args.cas_strength:.2f}",
+        ))
     if args.sharpen:
-        f.append(f"unsharp=lx=5:ly=5:la={args.sharpen_amount:.1f}:cx=3:cy=3:ca=0.0")
+        f.append((
+            f"unsharp amount={args.sharpen_amount:.1f}",
+            "unsharp mask luma (stronger than CAS)",
+            f"unsharp=lx=5:ly=5:la={args.sharpen_amount:.1f}:cx=3:cy=3:ca=0.0",
+        ))
     return f
 
 
@@ -1684,30 +1705,35 @@ def cmd_enhance(args: argparse.Namespace) -> None:
         _CONSOLE.print(f"[red]error:[/] file not found: {input_path}")
         sys.exit(1)
 
-    filters = _build_enhance_filters(args)
+    plan = _build_enhance_filters(args)
 
-    if not filters:
+    if not plan:
         _CONSOLE.print(
             "[yellow]No effects selected — nothing to do.[/]\n"
             "Pass at least one flag: --balance-brightness, --warmth, --saturation, --cas, --sharpen"
         )
         sys.exit(1)
 
-    applied = ", ".join(filter(None, [
-        "brightness" if args.balance_brightness else "",
-        f"warmth {args.warmth:+.1f}" if args.warmth != 0.0 else "",
-        f"saturation ×{args.saturation:.1f}" if args.saturation != 1.0 else "",
-        f"CAS {args.cas_strength:.1f}" if args.cas else "",
-        f"sharpen {args.sharpen_amount:.1f}" if args.sharpen else "",
-    ]))
+    ffmpeg_filters = [f for _, _, f in plan]
+    applied_label  = "  |  ".join(label for label, _, _ in plan)
+
+    # ── Print filter plan ──
+    plan_table = Table(box=None, show_header=False, padding=(0, 2))
+    plan_table.add_column(style="cyan",  width=26)
+    plan_table.add_column(style="dim")
+    plan_table.add_column(style="dim cyan")
+    for i, (label, detail, ff) in enumerate(plan, 1):
+        plan_table.add_row(f"{i}.  {label}", detail, ff)
+
+    _CONSOLE.print()
+    _CONSOLE.print(Panel(
+        plan_table,
+        title=f"[bold blue]Enhance plan[/]  [dim]{input_path.name}[/]",
+        subtitle="[dim]all filters applied in a single ffmpeg pass[/]",
+        border_style="blue",
+    ))
 
     if args.dry_run:
-        _CONSOLE.print()
-        _CONSOLE.print(Panel(
-            "\n".join(f"[cyan]{f}[/]" for f in filters),
-            title=f"[bold]Filter chain[/]  ({applied})",
-            border_style="blue",
-        ))
         return
 
     test_mode = getattr(args, "test_mode", False)
@@ -1737,7 +1763,7 @@ def cmd_enhance(args: argparse.Namespace) -> None:
             if getattr(args, "test_sample", False):
                 mid = _probe_duration(input_path) / 2.0
                 test_start = _seconds_to_hms(max(0.0, mid - duration / 2.0))
-            LOG.info("TEST MODE — extracting %ds clip from %s", duration, input_path.name)
+            _CONSOLE.print(f"[dim]Test mode — extracting {duration}s clip from {input_path.name}…[/]")
             clip = work_dir / "test_clip.mkv"
             _run_live([
                 "ffmpeg", "-y", "-ss", test_start,
@@ -1762,24 +1788,20 @@ def cmd_enhance(args: argparse.Namespace) -> None:
             console=_CONSOLE,
         )
 
+        filter_labels = "  +  ".join(f"[cyan]{label}[/]" for label, _, _ in plan)
+
         with Live(
-            Panel(progress,
-                  title=f"[bold blue]Enhance[/]  {source.name}",
-                  subtitle=f"[dim]{applied}[/]",
-                  border_style="blue"),
+            Panel(progress, border_style="blue"),
             console=_CONSOLE,
             refresh_per_second=8,
         ) as live:
 
             def _refresh():
-                live.update(Panel(
-                    progress,
-                    title=f"[bold blue]Enhance[/]  {source.name}",
-                    subtitle=f"[dim]{applied}[/]",
-                    border_style="blue",
-                ))
+                live.update(Panel(progress, border_style="blue"))
 
-            tid = progress.add_task("[cyan]Applying filters[/]", total=total or None)
+            tid = progress.add_task(
+                f"Applying  {filter_labels}", total=total or None
+            )
 
             def _on_progress(line: str) -> None:
                 if m := re.search(r"frame=\s*(\d+)", line):
@@ -1788,40 +1810,43 @@ def cmd_enhance(args: argparse.Namespace) -> None:
 
             _run_tracking(
                 ["ffmpeg", "-y", "-i", str(source),
-                 "-vf", ",".join(filters),
+                 "-vf", ",".join(ffmpeg_filters),
                  *vcodec, "-c:a", "copy", str(enhanced)],
                 on_stderr=_on_progress,
             )
             progress.update(tid, completed=total or 1, total=total or 1,
-                            description="[green]Done[/]  ✓")
+                            description=f"[green]✓[/]  {filter_labels}")
 
             # ── Side-by-side comparison ──
             if compare:
                 tid2 = progress.add_task("[cyan]Side-by-side comparison[/]", total=total or None)
-
-                def _on_cmp(line: str) -> None:
-                    if m := re.search(r"frame=\s*(\d+)", line):
-                        progress.update(tid2, completed=int(m.group(1)), total=total)
-                        _refresh()
-
                 make_comparison(source, enhanced, output_path,
                                on_progress=lambda s, d, t: (
                                    progress.update(tid2, completed=d, total=t), _refresh()
                                ),
-                               right_label=applied)
+                               right_label=applied_label)
                 progress.update(tid2, completed=total or 1, total=total or 1,
-                                description="[green]Done[/]  ✓")
+                                description="[green]✓[/]  Side-by-side comparison")
 
             _refresh()
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    # ── Summary ──
+    summary_table = Table(box=None, show_header=False, padding=(0, 2))
+    summary_table.add_column(style="dim", width=12)
+    summary_table.add_column()
+    for label, detail, ff in plan:
+        summary_table.add_row(f"[green]✓[/]  {label}", f"[dim]{detail}[/]")
+    summary_table.add_row("", "")
+    if compare:
+        summary_table.add_row("Output", f"[cyan]{output_path}[/]  [dim]← side-by-side comparison[/]")
+    else:
+        summary_table.add_row("Output", f"[cyan]{output_path}[/]")
+
     _CONSOLE.print()
-    _CONSOLE.print(Panel(
-        f"[green]✓[/]  {output_path}\n[dim]Applied: {applied}[/]",
-        border_style="green",
-    ))
+    _CONSOLE.print(Panel(summary_table, title="[bold green]Done[/]", border_style="green"))
 
 
 def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
