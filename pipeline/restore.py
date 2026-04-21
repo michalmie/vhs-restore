@@ -1784,12 +1784,30 @@ def cmd_enhance(args: argparse.Namespace) -> None:
         _CONSOLE.print(f"[red]error:[/] file not found: {input_path}")
         sys.exit(1)
 
+    use_qtgmc = getattr(args, "qtgmc", False)
+    use_knlm  = getattr(args, "knlm",  False)
+    use_vs    = use_qtgmc or use_knlm
+
+    # Build VapourSynth step descriptions (for display only)
+    vs_plan: list[tuple[str, str]] = []
+    if use_qtgmc:
+        preset = getattr(args, "qtgmc_preset", "Slow")
+        vs_plan.append(("QTGMC", f"preset={preset}  —  high-quality deinterlace"))
+    if use_knlm:
+        h = getattr(args, "knlm_h", 1.2)
+        d = getattr(args, "knlm_d", 1)
+        vs_plan.append(("KNLMeansCL", f"h={h}  d={d}  —  GPU denoising (CUDA)"))
+    if use_vs:
+        vs_plan.append(("levels 16-235", "always applied in VapourSynth stage"))
+
+    # Build ffmpeg filter plan
     plan = _build_enhance_filters(args)
 
-    if not plan:
+    if not use_vs and not plan:
         _CONSOLE.print(
             "[yellow]No effects selected — nothing to do.[/]\n"
             "Pass at least one flag, e.g.:\n"
+            "  VapourSynth:      --qtgmc           --knlm\n"
             "  VHS corrections:  --deinterlace  --levels  --denoise  --repair-dropouts  --deflicker\n"
             "  Color:            --warmth 0.3   --saturation 1.3  --balance-brightness\n"
             "  Sharpness:        --cas          --sharpen\n"
@@ -1797,22 +1815,39 @@ def cmd_enhance(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    ffmpeg_filters = [f for _, _, f in plan]
-    applied_label  = "  |  ".join(label for label, _, _ in plan)
+    if use_vs:
+        _check_env()
 
-    # ── Print filter plan ──
+    # ── Print plan ──
+    n = 1
     plan_table = Table(box=None, show_header=False, padding=(0, 2))
-    plan_table.add_column(style="cyan",  width=26)
+    plan_table.add_column(style="cyan",  width=28)
     plan_table.add_column(style="dim")
     plan_table.add_column(style="dim cyan")
-    for i, (label, detail, ff) in enumerate(plan, 1):
-        plan_table.add_row(f"{i}.  {label}", detail, ff)
+
+    if vs_plan:
+        plan_table.add_row("[bold]VapourSynth pass[/]", "", "")
+        for label, detail in vs_plan:
+            plan_table.add_row(f"  {n}.  {label}", detail, "vapoursynth")
+            n += 1
+    if plan:
+        if vs_plan:
+            plan_table.add_row("", "", "")
+        subtitle_src = "on VapourSynth output" if vs_plan else "single pass"
+        plan_table.add_row(f"[bold]ffmpeg pass[/]  [dim]({subtitle_src})[/]", "", "")
+        for label, detail, ff in plan:
+            plan_table.add_row(f"  {n}.  {label}", detail, ff)
+            n += 1
+
+    applied_label = "  |  ".join(
+        [lbl for lbl, _ in vs_plan if lbl != "levels 16-235"] +
+        [lbl for lbl, _, _ in plan]
+    )
 
     _CONSOLE.print()
     _CONSOLE.print(Panel(
         plan_table,
-        title=f"[bold blue]Enhance plan[/]  [dim]{input_path.name}[/]",
-        subtitle="[dim]all filters applied in a single ffmpeg pass[/]",
+        title=f"[bold blue]Test plan[/]  [dim]{input_path.name}[/]",
         border_style="blue",
     ))
 
@@ -1837,28 +1872,24 @@ def cmd_enhance(args: argparse.Namespace) -> None:
     work_dir.mkdir(exist_ok=True)
 
     try:
-        source = input_path
+        source         = input_path
+        original_clip  = input_path  # kept for comparison (always the raw source)
 
-        # ── Test mode: extract short clip ──
+        # ── Extract test clip ──
         if test_mode:
-            test_start = getattr(args, "test_start", "00:05:00")
             duration   = getattr(args, "test_duration", 10)
-            if test_mode:  # --test-sample picks from middle
-                mid = _probe_duration(input_path) / 2.0
-                test_start = _seconds_to_hms(max(0.0, mid - duration / 2.0))
-            _CONSOLE.print(f"[dim]Test mode — extracting {duration}s clip from {input_path.name}…[/]")
+            mid        = _probe_duration(input_path) / 2.0
+            test_start = _seconds_to_hms(max(0.0, mid - duration / 2.0))
+            _CONSOLE.print(f"[dim]Extracting {duration}s clip from middle of {input_path.name}…[/]")
             clip = work_dir / "test_clip.mkv"
             _run_live([
                 "ffmpeg", "-y", "-ss", test_start,
                 "-i", str(input_path),
                 "-t", str(duration), "-c", "copy", str(clip),
             ])
-            source = clip
+            source = original_clip = clip
 
         total = _probe_frame_count(source)
-
-        # ── Apply filters ──
-        enhanced = work_dir / ("enhanced" + output_path.suffix) if compare else output_path
 
         progress = Progress(
             SpinnerColumn(),
@@ -1871,56 +1902,102 @@ def cmd_enhance(args: argparse.Namespace) -> None:
             console=_CONSOLE,
         )
 
-        filter_labels = "  +  ".join(f"[cyan]{label}[/]" for label, _, _ in plan)
-
-        with Live(
-            Panel(progress, border_style="blue"),
-            console=_CONSOLE,
-            refresh_per_second=8,
-        ) as live:
+        with Live(Panel(progress, border_style="blue"), console=_CONSOLE,
+                  refresh_per_second=8) as live:
 
             def _refresh():
                 live.update(Panel(progress, border_style="blue"))
 
-            tid = progress.add_task(
-                f"Applying  {filter_labels}", total=total or None
-            )
+            # ── VapourSynth pass ──
+            if use_vs:
+                vs_label = "  +  ".join(
+                    f"[cyan]{lbl}[/]" for lbl, _ in vs_plan if lbl != "levels 16-235"
+                )
+                tid_vs = progress.add_task(
+                    f"VapourSynth  {vs_label}", total=total or None
+                )
+                vs_cfg = Config(
+                    skip_deinterlace = not use_qtgmc,
+                    skip_denoise     = not use_knlm,
+                    qtgmc_preset     = getattr(args, "qtgmc_preset", "Slow"),
+                    knlm_h           = getattr(args, "knlm_h", 1.2),
+                    knlm_d           = getattr(args, "knlm_d", 1),
+                    gpu_device_id    = getattr(args, "gpu", 0),
+                    levels_min_in    = 16,
+                    levels_max_in    = 235,
+                )
+                vs_out = work_dir / "vs_out.mkv"
+                stage_vs(source, vs_out, vs_cfg, work_dir,
+                         on_progress=lambda s, d, t: (
+                             progress.update(tid_vs, completed=d, total=t), _refresh()
+                         ))
+                progress.update(tid_vs, completed=total or 1, total=total or 1,
+                                description=f"[green]✓[/]  VapourSynth  {vs_label}")
+                source = vs_out
+                _refresh()
 
-            def _on_progress(line: str) -> None:
-                if m := re.search(r"frame=\s*(\d+)", line):
-                    progress.update(tid, completed=int(m.group(1)), total=total)
-                    _refresh()
+            # ── ffmpeg pass ──
+            ffmpeg_filters = [ff for _, _, ff in plan]
+            enhanced = work_dir / ("enhanced" + output_path.suffix) if compare else output_path
 
-            _run_tracking(
-                ["ffmpeg", "-y", "-i", str(source),
-                 "-vf", ",".join(ffmpeg_filters),
-                 *vcodec, "-c:a", "copy", str(enhanced)],
-                on_stderr=_on_progress,
-            )
-            progress.update(tid, completed=total or 1, total=total or 1,
-                            description=f"[green]✓[/]  {filter_labels}")
+            if ffmpeg_filters:
+                ff_label = "  +  ".join(f"[cyan]{lbl}[/]" for lbl, _, _ in plan)
+                tid_ff = progress.add_task(f"ffmpeg  {ff_label}", total=total or None)
+
+                def _on_ff(line: str) -> None:
+                    if m := re.search(r"frame=\s*(\d+)", line):
+                        progress.update(tid_ff, completed=int(m.group(1)), total=total)
+                        _refresh()
+
+                _run_tracking(
+                    ["ffmpeg", "-y", "-i", str(source),
+                     "-vf", ",".join(ffmpeg_filters),
+                     *vcodec, "-c:a", "copy", str(enhanced)],
+                    on_stderr=_on_ff,
+                )
+                progress.update(tid_ff, completed=total or 1, total=total or 1,
+                                description=f"[green]✓[/]  ffmpeg  {ff_label}")
+                _refresh()
+            elif use_vs:
+                # VS only — transcode to target codec without extra filters
+                tid_ff = progress.add_task("[cyan]Encoding output[/]", total=total or None)
+
+                def _on_enc(line: str) -> None:
+                    if m := re.search(r"frame=\s*(\d+)", line):
+                        progress.update(tid_ff, completed=int(m.group(1)), total=total)
+                        _refresh()
+
+                _run_tracking(
+                    ["ffmpeg", "-y", "-i", str(source),
+                     *vcodec, "-c:a", "copy", str(enhanced)],
+                    on_stderr=_on_enc,
+                )
+                progress.update(tid_ff, completed=total or 1, total=total or 1,
+                                description="[green]✓[/]  Encoding output")
+                _refresh()
 
             # ── Side-by-side comparison ──
             if compare:
-                tid2 = progress.add_task("[cyan]Side-by-side comparison[/]", total=total or None)
-                make_comparison(source, enhanced, output_path,
+                tid_cmp = progress.add_task("[cyan]Side-by-side comparison[/]", total=total or None)
+                make_comparison(original_clip, enhanced, output_path,
                                on_progress=lambda s, d, t: (
-                                   progress.update(tid2, completed=d, total=t), _refresh()
+                                   progress.update(tid_cmp, completed=d, total=t), _refresh()
                                ),
                                right_label=applied_label)
-                progress.update(tid2, completed=total or 1, total=total or 1,
+                progress.update(tid_cmp, completed=total or 1, total=total or 1,
                                 description="[green]✓[/]  Side-by-side comparison")
-
-            _refresh()
+                _refresh()
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     # ── Summary ──
     summary_table = Table(box=None, show_header=False, padding=(0, 2))
-    summary_table.add_column(style="dim", width=12)
+    summary_table.add_column(style="dim", width=14)
     summary_table.add_column()
-    for label, detail, ff in plan:
+    for label, detail in vs_plan:
+        summary_table.add_row(f"[green]✓[/]  {label}", f"[dim]{detail}[/]")
+    for label, detail, _ in plan:
         summary_table.add_row(f"[green]✓[/]  {label}", f"[dim]{detail}[/]")
     summary_table.add_row("", "")
     if compare:
@@ -1938,15 +2015,15 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="Test color/sharpness filters with a side-by-side preview (no VapourSynth required)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=textwrap.dedent("""\
-            All effects are opt-in and applied in a single ffmpeg pass.
-            Typical VHS workflow: --deinterlace --levels --denoise --saturation 1.3 --warmth 0.3 --cas
+            All effects are opt-in. VapourSynth flags require a working venv (setup_ubuntu.sh).
+            Typical VHS workflow (high quality): --qtgmc --knlm --saturation 1.3 --warmth 0.3 --cas
+            Typical VHS workflow (ffmpeg only):  --deinterlace --levels --denoise --saturation 1.3 --warmth 0.3
 
             examples:
-              %(prog)s capture.mkv out.mp4 --test-sample --levels --saturation 1.3 --warmth 0.3
-              %(prog)s capture.mkv out.mp4 --test-sample --deinterlace --denoise --cas
-              %(prog)s capture.mkv out.mp4 --test-sample --deinterlace --levels --denoise --saturation 1.3 --warmth 0.3 --cas --grain 8
-              %(prog)s capture.mkv out.mp4 --compare --levels --warmth 0.4 --cas
-              %(prog)s capture.mkv out.mp4 --dry-run --levels --denoise --warmth 0.3
+              %(prog)s capture.mkv out.mp4 --test-sample --qtgmc --knlm --saturation 1.3 --warmth 0.3 --cas
+              %(prog)s capture.mkv out.mp4 --test-sample --qtgmc --knlm --saturation 1.3 --warmth 0.3 --cas --grain 8
+              %(prog)s capture.mkv out.mp4 --test-sample --deinterlace --levels --denoise --saturation 1.3
+              %(prog)s capture.mkv out.mp4 --dry-run --qtgmc --knlm --warmth 0.3
         """),
     )
     p.add_argument("input",  type=Path, help="Source video file")
@@ -1963,6 +2040,21 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Clip start time HH:MM:SS (overridden by --test-sample)")
     g.add_argument("--test-duration", type=int, default=10,
                    help="Clip length in seconds")
+
+    g = p.add_argument_group("VapourSynth (high quality, requires setup)")
+    g.add_argument("--qtgmc", action="store_true",
+                   help="QTGMC deinterlacing — higher quality than --deinterlace (yadif)")
+    g.add_argument("--qtgmc-preset", default="Slow", dest="qtgmc_preset",
+                   choices=["Draft", "Fast", "Medium", "Slow", "Slower", "Placebo"],
+                   help="QTGMC quality preset")
+    g.add_argument("--knlm", action="store_true",
+                   help="KNLMeansCL GPU denoising — higher quality than --denoise (hqdn3d)")
+    g.add_argument("--knlm-h", type=float, default=1.2, dest="knlm_h",
+                   help="KNLMeansCL strength: 0.8=light  1.2=balanced  2.0=aggressive")
+    g.add_argument("--knlm-d", type=int, default=1, dest="knlm_d",
+                   help="KNLMeansCL temporal radius in frames")
+    g.add_argument("--gpu", type=int, default=0, dest="gpu",
+                   help="GPU device ID for KNLMeansCL")
 
     g = p.add_argument_group("VHS corrections  ← start here")
     g.add_argument("--deinterlace", action="store_true",
