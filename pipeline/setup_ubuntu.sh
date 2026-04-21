@@ -221,12 +221,12 @@ else
         if [ -n "$JFFMPEG_PKG" ]; then
             export PKG_CONFIG_PATH="$JFFMPEG_PKG:$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
         fi
-        ./autogen.sh > "$FFMS2_LOG" 2>&1
-        # Pass jellyfin include/lib paths explicitly so configure finds ffmpeg regardless of pkg-config
-        CPPFLAGS="-I${JFFMPEG}/include" \
-        LDFLAGS="-L${JFFMPEG}/lib -Wl,-rpath,${JFFMPEG}/lib" \
-        ./configure --prefix=/usr/local --with-vapoursynth >> "$FFMS2_LOG" 2>&1
-        if make -j"$(nproc)" >> "$FFMS2_LOG" 2>&1; then
+        # Run all build steps in one if-chain so set -e doesn't kill the script on failure
+        if ./autogen.sh >> "$FFMS2_LOG" 2>&1 \
+           && CPPFLAGS="-I${JFFMPEG}/include" \
+              LDFLAGS="-L${JFFMPEG}/lib -Wl,-rpath,${JFFMPEG}/lib" \
+              ./configure --prefix=/usr/local --with-vapoursynth >> "$FFMS2_LOG" 2>&1 \
+           && make -j"$(nproc)" >> "$FFMS2_LOG" 2>&1; then
             # autotools puts the VS plugin .so in src/vapoursynth/.libs/
             BUILT_SO=$(find . -name "libffms2.so" ! -name "*.la" 2>/dev/null | head -1)
             if [ -n "$BUILT_SO" ]; then
