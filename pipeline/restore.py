@@ -1705,6 +1705,9 @@ def cmd_enhance(args: argparse.Namespace) -> None:
         ))
         return
 
+    test_mode = getattr(args, "test_mode", False)
+    compare   = getattr(args, "compare", False) or test_mode
+
     if args.output_codec == "h264":
         vcodec = ["-c:v", "libx264", "-crf", str(args.output_crf),
                   "-preset", "slow", "-pix_fmt", "yuv420p"]
@@ -1716,52 +1719,96 @@ def cmd_enhance(args: argparse.Namespace) -> None:
     else:
         vcodec = ["-c:v", "prores_ks", "-profile:v", "hq", "-pix_fmt", "yuv422p10le"]
 
-    total = _probe_frame_count(input_path)
+    work_dir = output_path.parent / f".vhs_enhance_{output_path.stem}"
+    work_dir.mkdir(exist_ok=True)
 
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold]{task.description}"),
-        BarColumn(bar_width=32),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        expand=False,
-        console=_CONSOLE,
-    )
+    try:
+        source = input_path
 
-    with Live(
-        Panel(progress,
-              title=f"[bold blue]Enhance[/]  {input_path.name}",
-              subtitle=f"[dim]{applied}[/]",
-              border_style="blue"),
-        console=_CONSOLE,
-        refresh_per_second=8,
-    ) as live:
+        # ── Test mode: extract short clip ──
+        if test_mode:
+            test_start = getattr(args, "test_start", "00:05:00")
+            duration   = getattr(args, "test_duration", 10)
+            if getattr(args, "test_sample", False):
+                mid = _probe_duration(input_path) / 2.0
+                test_start = _seconds_to_hms(max(0.0, mid - duration / 2.0))
+            LOG.info("TEST MODE — extracting %ds clip from %s", duration, input_path.name)
+            clip = work_dir / "test_clip.mkv"
+            _run_live([
+                "ffmpeg", "-y", "-ss", test_start,
+                "-i", str(input_path),
+                "-t", str(duration), "-c", "copy", str(clip),
+            ])
+            source = clip
 
-        def _refresh():
-            live.update(Panel(
-                progress,
-                title=f"[bold blue]Enhance[/]  {input_path.name}",
-                subtitle=f"[dim]{applied}[/]",
-                border_style="blue",
-            ))
+        total = _probe_frame_count(source)
 
-        tid = progress.add_task(f"[cyan]Applying filters[/]", total=total or None)
+        # ── Apply filters ──
+        enhanced = work_dir / ("enhanced" + output_path.suffix) if compare else output_path
 
-        def _on_progress(line: str) -> None:
-            if m := re.search(r"frame=\s*(\d+)", line):
-                progress.update(tid, completed=int(m.group(1)), total=total)
-                _refresh()
-
-        _run_tracking(
-            ["ffmpeg", "-y", "-i", str(input_path),
-             "-vf", ",".join(filters),
-             *vcodec, "-c:a", "copy", str(output_path)],
-            on_stderr=_on_progress,
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(bar_width=32),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            expand=False,
+            console=_CONSOLE,
         )
-        progress.update(tid, completed=total or 1, total=total or 1,
-                        description="[green]Done[/]  ✓")
-        _refresh()
+
+        with Live(
+            Panel(progress,
+                  title=f"[bold blue]Enhance[/]  {source.name}",
+                  subtitle=f"[dim]{applied}[/]",
+                  border_style="blue"),
+            console=_CONSOLE,
+            refresh_per_second=8,
+        ) as live:
+
+            def _refresh():
+                live.update(Panel(
+                    progress,
+                    title=f"[bold blue]Enhance[/]  {source.name}",
+                    subtitle=f"[dim]{applied}[/]",
+                    border_style="blue",
+                ))
+
+            tid = progress.add_task("[cyan]Applying filters[/]", total=total or None)
+
+            def _on_progress(line: str) -> None:
+                if m := re.search(r"frame=\s*(\d+)", line):
+                    progress.update(tid, completed=int(m.group(1)), total=total)
+                    _refresh()
+
+            _run_tracking(
+                ["ffmpeg", "-y", "-i", str(source),
+                 "-vf", ",".join(filters),
+                 *vcodec, "-c:a", "copy", str(enhanced)],
+                on_stderr=_on_progress,
+            )
+            progress.update(tid, completed=total or 1, total=total or 1,
+                            description="[green]Done[/]  ✓")
+
+            # ── Side-by-side comparison ──
+            if compare:
+                tid2 = progress.add_task("[cyan]Side-by-side comparison[/]", total=total or None)
+
+                def _on_cmp(line: str) -> None:
+                    if m := re.search(r"frame=\s*(\d+)", line):
+                        progress.update(tid2, completed=int(m.group(1)), total=total)
+                        _refresh()
+
+                make_comparison(source, enhanced, output_path, on_progress=lambda s, d, t: (
+                    progress.update(tid2, completed=d, total=t), _refresh()
+                ))
+                progress.update(tid2, completed=total or 1, total=total or 1,
+                                description="[green]Done[/]  ✓")
+
+            _refresh()
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     _CONSOLE.print()
     _CONSOLE.print(Panel(
@@ -1779,10 +1826,11 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
             Each effect is opt-in. Combine freely.
 
             examples:
+              %(prog)s capture.mkv out.mp4 --test --test-sample --warmth 0.3
+              %(prog)s capture.mkv out.mp4 --test --test-sample --cas
+              %(prog)s capture.mkv out.mp4 --test --test-sample --saturation 1.3 --warmth 0.3 --cas
               %(prog)s restored.mkv out.mp4 --warmth 0.3 --saturation 1.3
-              %(prog)s restored.mkv out.mp4 --cas --balance-brightness
-              %(prog)s restored.mkv out.mp4 --warmth 0.4 --saturation 1.25 --cas --cas-strength 0.7
-              %(prog)s restored.mkv out.mp4 --sharpen --sharpen-amount 1.2
+              %(prog)s restored.mkv out.mp4 --compare --warmth 0.4 --cas
               %(prog)s restored.mkv out.mp4 --dry-run --warmth 0.3 --cas
         """),
     )
@@ -1790,6 +1838,18 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p.add_argument("output", type=Path, help="Output file")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the filter chain without processing")
+    p.add_argument("--compare", action="store_true",
+                   help="Generate side-by-side before/after comparison video")
+
+    g = p.add_argument_group("Test mode")
+    g.add_argument("--test", action="store_true", dest="test_mode",
+                   help="Extract a short clip and output side-by-side comparison")
+    g.add_argument("--test-sample", action="store_true",
+                   help="Pick the clip from the middle of the video")
+    g.add_argument("--test-start", default="00:05:00",
+                   help="Clip start time HH:MM:SS (overridden by --test-sample)")
+    g.add_argument("--test-duration", type=int, default=10,
+                   help="Clip length in seconds")
 
     g = p.add_argument_group("Color")
     g.add_argument("--balance-brightness", action="store_true", dest="balance_brightness",
