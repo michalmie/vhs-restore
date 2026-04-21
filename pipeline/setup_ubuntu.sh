@@ -272,8 +272,8 @@ _build_meson_plugin() {
 _build_meson_plugin mvtools "https://github.com/dubhater/vapoursynth-mvtools" "mvtools.so"
 
 # KNLMeansCL — GPU denoising via OpenCL
-# meson shared_module() produces KNLMeansCL.so (no lib prefix) on Linux
-_build_meson_plugin knlm   "https://github.com/Khanattila/KNLMeansCL"        "KNLMeansCL.so"
+# meson shared_library() produces libknlmeanscl.so (lowercased, with lib prefix) on Linux
+_build_meson_plugin knlm   "https://github.com/Khanattila/KNLMeansCL"        "libknlmeanscl.so"
 
 
 # ── 7. PyTorch + Real-ESRGAN ─────────────────────────────────────────────────
