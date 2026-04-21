@@ -2,7 +2,7 @@
 # Activate the vhs-env virtual environment and run the pipeline.
 # Usage: ./vhs.sh <subcommand> [args...]
 #   ./vhs.sh restore capture.mkv output.mkv --test --test-sample
-#   ./vhs.sh enhance restored.mkv out.mp4 --warmth 0.3 --cas
+#   ./vhs.sh test capture.mkv out.mp4 --test-sample --warmth 0.3 --cas
 #   ./vhs.sh analyze capture.mkv
 #   ./vhs.sh trim capture.mkv
 

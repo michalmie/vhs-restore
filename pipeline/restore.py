@@ -1851,16 +1851,16 @@ def cmd_enhance(args: argparse.Namespace) -> None:
 
 def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p = sub.add_parser(
-        "enhance",
-        help="Apply color and sharpness improvements (no VapourSynth required)",
+        "test",
+        help="Test color/sharpness filters with a side-by-side preview (no VapourSynth required)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=textwrap.dedent("""\
             Each effect is opt-in. Combine freely.
 
             examples:
-              %(prog)s capture.mkv out.mp4 --test --test-sample --warmth 0.3
-              %(prog)s capture.mkv out.mp4 --test --test-sample --cas
-              %(prog)s capture.mkv out.mp4 --test --test-sample --saturation 1.3 --warmth 0.3 --cas
+              %(prog)s capture.mkv out.mp4 --test-sample --warmth 0.3
+              %(prog)s capture.mkv out.mp4 --test-sample --cas
+              %(prog)s capture.mkv out.mp4 --test-sample --saturation 1.3 --warmth 0.3 --cas
               %(prog)s restored.mkv out.mp4 --warmth 0.3 --saturation 1.3
               %(prog)s restored.mkv out.mp4 --compare --warmth 0.4 --cas
               %(prog)s restored.mkv out.mp4 --dry-run --warmth 0.3 --cas
@@ -2047,7 +2047,7 @@ def main() -> None:
               analyze   Probe a video file and print recommended restore settings
               trim      Remove leading/trailing black screens from a capture
               restore   Run the full pipeline (deinterlace → denoise → upscale → grain)
-              enhance   Apply color/sharpness improvements independently (no VapourSynth)
+              test      Test color/sharpness filters with side-by-side preview (no VapourSynth)
 
             quick start:
               python pipeline/restore.py analyze capture.mp4
@@ -2055,7 +2055,7 @@ def main() -> None:
               python pipeline/restore.py restore capture.mp4 output.mkv
               python pipeline/restore.py restore capture.mp4 output.mp4 --profile streaming
               python pipeline/restore.py restore capture.mp4 out.mkv --test --test-sample
-              python pipeline/restore.py enhance restored.mkv out.mp4 --warmth 0.3 --saturation 1.3 --cas
+              python pipeline/restore.py test capture.mkv out.mp4 --test-sample --warmth 0.3 --saturation 1.3 --cas
         """),
     )
     p.add_argument("-v", "--verbose", action="store_true",
@@ -2120,7 +2120,7 @@ def main() -> None:
         if getattr(args, "test_sample", False) and not getattr(args, "test_mode", False):
             args.test_mode = True
         cmd_restore(args)
-    elif args.subcommand == "enhance":
+    elif args.subcommand == "test":
         cmd_enhance(args)
 
 
