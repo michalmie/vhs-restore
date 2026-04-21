@@ -1658,42 +1658,121 @@ def cmd_restore(args: argparse.Namespace) -> None:
 # ── Enhance command ───────────────────────────────────────────────────────────
 
 def _build_enhance_filters(args: argparse.Namespace) -> list[tuple[str, str, str]]:
-    """Return list of (label, detail, ffmpeg_filter) for each active effect."""
+    """Return list of (label, detail, ffmpeg_filter) in correct VHS processing order.
+
+    Order: deinterlace → dropout repair → denoise → levels → color → sharpen → grain
+    Each ffmpeg_filter string may contain multiple comma-joined filters (e.g. dropout repair).
+    """
     f = []
-    if args.balance_brightness:
+
+    # 1. Deinterlace — must be first; converts interlaced fields to progressive frames
+    if getattr(args, "deinterlace", False):
+        f.append((
+            "deinterlace",
+            "yadif — remove combing/interlacing  (full pipeline uses slower QTGMC)",
+            "yadif=mode=0:parity=-1:deint=0",
+        ))
+
+    # 2. Dropout / line artifact repair
+    if getattr(args, "repair_dropouts", False):
+        f.append((
+            "repair-dropouts",
+            "temporal median blend + temporal denoise — reduce VHS horizontal-line dropouts",
+            "tblend=all_mode=median,hqdn3d=0:0:3:3",
+        ))
+
+    # 3. Denoise
+    if getattr(args, "denoise", False):
+        s  = getattr(args, "denoise_strength", 1.0)
+        ls = round(s * 4,   1)
+        cs = round(s * 3,   1)
+        lt = round(s * 6,   1)
+        ct = round(s * 4.5, 1)
+        f.append((
+            f"denoise strength={s:.1f}",
+            f"hqdn3d spatial+temporal  (full pipeline uses GPU KNLMeansCL)",
+            f"hqdn3d={ls}:{cs}:{lt}:{ct}",
+        ))
+
+    # 4. VHS color levels — map 16-235 range to full 0-255
+    if getattr(args, "levels", False):
+        f.append((
+            "levels VHS 16-235",
+            "expand black/white points to full range — fixes washed-out look",
+            "colorlevels=rimin=0.0627:gimin=0.0627:bimin=0.0627"
+            ":rimax=0.9216:gimax=0.9216:bimax=0.9216",
+        ))
+
+    # 5. Deflicker — smooth frame-to-frame brightness variation common in VHS
+    if getattr(args, "deflicker", False):
+        f.append((
+            "deflicker",
+            "smooth inter-frame brightness fluctuations",
+            "deflicker=size=5:mode=am",
+        ))
+
+    # 6. Balance brightness
+    if getattr(args, "balance_brightness", False):
         f.append((
             "balance-brightness",
-            "auto-normalize histogram",
+            "auto-normalize histogram (use after --levels for fine-tuning)",
             "normalize=blackpt=black:whitept=white:smoothing=5",
         ))
-    if args.warmth != 0.0:
-        w = args.warmth * 0.15
-        rr = round(max(0.5, min(1.5, 1.0 + w)), 3)
-        bb = round(max(0.5, min(1.5, 1.0 - w)), 3)
-        direction = "warmer (boost R, reduce B)" if args.warmth > 0 else "cooler (boost B, reduce R)"
+
+    # 7. Warmth
+    if getattr(args, "warmth", 0.0) != 0.0:
+        w   = args.warmth * 0.15
+        rr  = round(max(0.5, min(1.5, 1.0 + w)), 3)
+        bb  = round(max(0.5, min(1.5, 1.0 - w)), 3)
+        dir = "warmer (boost R, reduce B)" if args.warmth > 0 else "cooler (boost B, reduce R)"
         f.append((
             f"warmth {args.warmth:+.1f}",
-            f"{direction}  →  R×{rr}  B×{bb}",
+            f"{dir}  →  R×{rr}  B×{bb}",
             f"colorchannelmixer=rr={rr}:bb={bb}",
         ))
-    if args.saturation != 1.0:
+
+    # 8. Saturation
+    if getattr(args, "saturation", 1.0) != 1.0:
         f.append((
             f"saturation ×{args.saturation:.2f}",
             "boost" if args.saturation > 1 else "reduce",
             f"eq=saturation={args.saturation:.2f}",
         ))
-    if args.cas:
+
+    # 9. Aspect ratio fix
+    if getattr(args, "fix_ar", False):
+        ar = getattr(args, "ar_target", "4:3")
+        f.append((
+            f"fix-ar {ar}",
+            "set display aspect ratio — corrects anamorphic/square-pixel mismatch",
+            f"setdar={ar.replace(':', '/')}",
+        ))
+
+    # 10. CAS sharpening
+    if getattr(args, "cas", False):
         f.append((
             f"CAS strength={args.cas_strength:.2f}",
-            "contrast-adaptive sharpening (gentle)",
+            "contrast-adaptive sharpening (gentle, natural-looking)",
             f"cas=strength={args.cas_strength:.2f}",
         ))
-    if args.sharpen:
+
+    # 11. Unsharp mask
+    if getattr(args, "sharpen", False):
         f.append((
             f"unsharp amount={args.sharpen_amount:.1f}",
-            "unsharp mask luma (stronger than CAS)",
+            "unsharp mask luma (stronger than CAS, can look artificial at high values)",
             f"unsharp=lx=5:ly=5:la={args.sharpen_amount:.1f}:cx=3:cy=3:ca=0.0",
         ))
+
+    # 12. Film grain — always last; adds back natural texture after denoising
+    if getattr(args, "grain", 0) > 0:
+        s = args.grain
+        f.append((
+            f"grain strength={s}",
+            "synthetic film grain — prevents 'plastic' look after heavy denoising",
+            f"noise=alls={s}:allf=t",
+        ))
+
     return f
 
 
@@ -1710,7 +1789,11 @@ def cmd_enhance(args: argparse.Namespace) -> None:
     if not plan:
         _CONSOLE.print(
             "[yellow]No effects selected — nothing to do.[/]\n"
-            "Pass at least one flag: --balance-brightness, --warmth, --saturation, --cas, --sharpen"
+            "Pass at least one flag, e.g.:\n"
+            "  VHS corrections:  --deinterlace  --levels  --denoise  --repair-dropouts  --deflicker\n"
+            "  Color:            --warmth 0.3   --saturation 1.3  --balance-brightness\n"
+            "  Sharpness:        --cas          --sharpen\n"
+            "  Output:           --grain 8      --fix-ar"
         )
         sys.exit(1)
 
@@ -1736,7 +1819,7 @@ def cmd_enhance(args: argparse.Namespace) -> None:
     if args.dry_run:
         return
 
-    test_mode = getattr(args, "test_mode", False)
+    test_mode = getattr(args, "test_sample", False)
     compare   = getattr(args, "compare", False) or test_mode
 
     if args.output_codec == "h264":
@@ -1760,7 +1843,7 @@ def cmd_enhance(args: argparse.Namespace) -> None:
         if test_mode:
             test_start = getattr(args, "test_start", "00:05:00")
             duration   = getattr(args, "test_duration", 10)
-            if getattr(args, "test_sample", False):
+            if test_mode:  # --test-sample picks from middle
                 mid = _probe_duration(input_path) / 2.0
                 test_start = _seconds_to_hms(max(0.0, mid - duration / 2.0))
             _CONSOLE.print(f"[dim]Test mode — extracting {duration}s clip from {input_path.name}…[/]")
@@ -1855,15 +1938,15 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="Test color/sharpness filters with a side-by-side preview (no VapourSynth required)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=textwrap.dedent("""\
-            Each effect is opt-in. Combine freely.
+            All effects are opt-in and applied in a single ffmpeg pass.
+            Typical VHS workflow: --deinterlace --levels --denoise --saturation 1.3 --warmth 0.3 --cas
 
             examples:
-              %(prog)s capture.mkv out.mp4 --test-sample --warmth 0.3
-              %(prog)s capture.mkv out.mp4 --test-sample --cas
-              %(prog)s capture.mkv out.mp4 --test-sample --saturation 1.3 --warmth 0.3 --cas
-              %(prog)s restored.mkv out.mp4 --warmth 0.3 --saturation 1.3
-              %(prog)s restored.mkv out.mp4 --compare --warmth 0.4 --cas
-              %(prog)s restored.mkv out.mp4 --dry-run --warmth 0.3 --cas
+              %(prog)s capture.mkv out.mp4 --test-sample --levels --saturation 1.3 --warmth 0.3
+              %(prog)s capture.mkv out.mp4 --test-sample --deinterlace --denoise --cas
+              %(prog)s capture.mkv out.mp4 --test-sample --deinterlace --levels --denoise --saturation 1.3 --warmth 0.3 --cas --grain 8
+              %(prog)s capture.mkv out.mp4 --compare --levels --warmth 0.4 --cas
+              %(prog)s capture.mkv out.mp4 --dry-run --levels --denoise --warmth 0.3
         """),
     )
     p.add_argument("input",  type=Path, help="Source video file")
@@ -1873,15 +1956,27 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     p.add_argument("--compare", action="store_true",
                    help="Generate side-by-side before/after comparison video")
 
-    g = p.add_argument_group("Test mode")
-    g.add_argument("--test", action="store_true", dest="test_mode",
-                   help="Extract a short clip and output side-by-side comparison")
+    g = p.add_argument_group("Clip / test mode")
     g.add_argument("--test-sample", action="store_true",
-                   help="Pick the clip from the middle of the video")
+                   help="Extract a 10s clip from the middle and output side-by-side comparison")
     g.add_argument("--test-start", default="00:05:00",
                    help="Clip start time HH:MM:SS (overridden by --test-sample)")
     g.add_argument("--test-duration", type=int, default=10,
                    help="Clip length in seconds")
+
+    g = p.add_argument_group("VHS corrections  ← start here")
+    g.add_argument("--deinterlace", action="store_true",
+                   help="Remove interlacing/combing (yadif; full pipeline uses QTGMC)")
+    g.add_argument("--levels", action="store_true",
+                   help="Map VHS 16-235 black/white points to full 0-255 range (big impact)")
+    g.add_argument("--denoise", action="store_true",
+                   help="Spatial + temporal noise reduction (hqdn3d; full pipeline uses GPU KNLMeansCL)")
+    g.add_argument("--denoise-strength", type=float, default=1.0, dest="denoise_strength",
+                   help="Denoise intensity: 0.5=light  1.0=moderate  2.0=aggressive")
+    g.add_argument("--repair-dropouts", action="store_true", dest="repair_dropouts",
+                   help="Reduce VHS horizontal-line dropout artifacts (temporal median blend)")
+    g.add_argument("--deflicker", action="store_true",
+                   help="Smooth frame-to-frame brightness fluctuations")
 
     g = p.add_argument_group("Color")
     g.add_argument("--balance-brightness", action="store_true", dest="balance_brightness",
@@ -1901,7 +1996,13 @@ def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     g.add_argument("--sharpen-amount", type=float, default=1.5, dest="sharpen_amount",
                    help="Unsharp mask strength (0.5–3.0)")
 
-    g = p.add_argument_group("Output format")
+    g = p.add_argument_group("Output")
+    g.add_argument("--grain", type=int, default=0, metavar="0-20",
+                   help="Add synthetic film grain (0=off, 4=subtle, 8=natural, 15=heavy)")
+    g.add_argument("--fix-ar", action="store_true", dest="fix_ar",
+                   help="Set display aspect ratio (corrects squashed/stretched image)")
+    g.add_argument("--ar-target", default="4:3", dest="ar_target",
+                   help="Target aspect ratio for --fix-ar (e.g. 4:3, 16:9)")
     g.add_argument("--codec", dest="output_codec", default="h264",
                    choices=["ffv1", "prores", "h264", "h265"],
                    help="Video codec")
