@@ -199,38 +199,31 @@ else
         warn "havsfunc install failed — QTGMC unavailable"
 fi
 
-# ffms2 — requires ffmpeg ≥ 7.x; build from source against jellyfin-ffmpeg7
-# (system apt libffms2 is the C library only, not a VapourSynth plugin)
-rm -f "$VS_PLUGIN_DIR/libffms2.so"  # remove stale symlink from previous attempts
-if find "$VS_PLUGIN_DIR" -name "libffms2.so" 2>/dev/null | grep -qv "^$"; then
+# ffms2 VapourSynth plugin — build tag 2.40 against system ffmpeg 4.x
+# (latest ffms2 HEAD requires ffmpeg 7.x; v2.40 requires only 4.x which is what
+# Ubuntu 22.04 ships; system libffms2-dev installs only the C library, not the VS plugin)
+rm -f "$VS_PLUGIN_DIR/libffms2.so"  # remove stale broken symlinks from previous attempts
+if find "$VS_PLUGIN_DIR" -name "libffms2.so" 2>/dev/null | grep -q .; then
     ok "ffms2 (already installed)"
 else
-    JFFMPEG="/usr/lib/jellyfin-ffmpeg"
     FFMS2_SRC="/tmp/vs-plugin-ffms2"
     FFMS2_LOG="/tmp/vs-build-ffms2.log"
-    echo "  Building ffms2 against jellyfin-ffmpeg7..."
+    echo "  Building ffms2 v2.40 (system ffmpeg 4.x)..."
     rm -rf "$FFMS2_SRC"
-    if [ ! -d "$JFFMPEG" ]; then
-        warn "ffms2: jellyfin-ffmpeg7 not found at $JFFMPEG — video source unavailable"
-    elif ! git clone -q --depth=1 https://github.com/FFMS/ffms2 "$FFMS2_SRC"; then
-        warn "ffms2: git clone failed"
+    if ! git clone -q --depth=1 --branch 2.40 https://github.com/FFMS/ffms2 "$FFMS2_SRC" >> "$FFMS2_LOG" 2>&1; then
+        warn "ffms2: git clone failed — check $FFMS2_LOG"
     else
         cd "$FFMS2_SRC"
-        # jellyfin-ffmpeg7 does not ship .pc files — bypass pkg-config entirely using
-        # FFMPEG_CFLAGS/FFMPEG_LIBS as suggested by the configure script itself
-        # Run all build steps in one if-chain so set -e doesn't kill the script on failure
+        # v2.40 uses system ffmpeg 4.x headers; VS headers are in VS_PKG's parent include dir
         if ./autogen.sh >> "$FFMS2_LOG" 2>&1 \
            && PKG_CONFIG_PATH="$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-              FFMPEG_CFLAGS="-I${JFFMPEG}/include" \
-              FFMPEG_LIBS="-L${JFFMPEG}/lib -lavformat -lavcodec -lswscale -lavutil -lswresample" \
-              LDFLAGS="-Wl,-rpath,${JFFMPEG}/lib" \
               ./configure --prefix=/usr/local --with-vapoursynth >> "$FFMS2_LOG" 2>&1 \
            && make -j"$(nproc)" >> "$FFMS2_LOG" 2>&1; then
             # autotools puts the VS plugin .so in src/vapoursynth/.libs/
             BUILT_SO=$(find . -name "libffms2.so" ! -name "*.la" 2>/dev/null | head -1)
             if [ -n "$BUILT_SO" ]; then
-                cp "$BUILT_SO" "$VS_PLUGIN_DIR/libffms2.so"
-                ok "ffms2 (built against jellyfin-ffmpeg7)"
+                cp -L "$BUILT_SO" "$VS_PLUGIN_DIR/libffms2.so"
+                ok "ffms2 v2.40 (built from source)"
             else
                 warn "ffms2: build succeeded but libffms2.so not found — check $FFMS2_LOG"
             fi
@@ -259,11 +252,13 @@ _build_meson_plugin() {
     if PKG_CONFIG_PATH="$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
        meson setup build --buildtype=release -Ddefault_library=shared > "$log" 2>&1 \
        && ninja -C build -j"$(nproc)" >> "$log" 2>&1; then
-        find build -name "*.so" -exec cp {} "$VS_PLUGIN_DIR/" \;
+        # Use cp -L to dereference symlinks (meson sometimes produces versioned .so + symlink)
+        find build -name "*.so" | while read -r f; do cp -L "$f" "$VS_PLUGIN_DIR/"; done
         if find "$VS_PLUGIN_DIR" -name "$so_pattern" 2>/dev/null | grep -q .; then
             ok "$name (built from source)"
         else
-            warn "$name: built but $so_pattern not found in plugin dir — check $log"
+            ACTUAL=$(find build -name "*.so" 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')
+            warn "$name: built as '${ACTUAL:-?}' but expected '$so_pattern' — check $log"
         fi
     else
         warn "$name: build failed — last 20 lines of $log:"
