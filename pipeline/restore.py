@@ -122,6 +122,7 @@ class Config:
     repair_dropouts: bool = False    # VHS dropout / line artifact repair (median filter)
     balance_brightness: bool = False # auto-normalize brightness/contrast
     sharpen: bool = False            # unsharp mask after upscaling
+    cas: bool = False                # Contrast Adaptive Sharpening after upscaling
     fix_ar: bool = False             # correct aspect ratio (e.g. anamorphic → square pixels)
     audio_cleanup: bool = False      # spectral noise reduction on audio track
 
@@ -132,6 +133,8 @@ class Config:
     # ── Effect tuning ─────────────────────────────────────────────────────────
     sharpen_amount: float = 1.5      # unsharp luma amount (0.5–3.0)
     saturation: float = 1.0          # color saturation multiplier (1.0 = no change)
+    warmth: float = 0.0              # color temperature: -1.0=cooler  0.0=neutral  +1.0=warmer
+    cas_strength: float = 0.6        # CAS strength (0.0–1.0)
     ar_target: str = "4:3"           # target display aspect ratio for --fix-ar
     audio_cleanup_db: float = 10.0   # afftdn noise reduction dB (5=gentle, 20=strong)
 
@@ -394,6 +397,11 @@ def _pre_upscale_filters(cfg: Config) -> list[str]:
     if cfg.balance_brightness:
         # Stretch histogram to use full range; preserve relative tone
         f.append("normalize=blackpt=black:whitept=white:smoothing=5")
+    if cfg.warmth != 0.0:
+        w = cfg.warmth * 0.15
+        rr = round(max(0.5, min(1.5, 1.0 + w)), 3)
+        bb = round(max(0.5, min(1.5, 1.0 - w)), 3)
+        f.append(f"colorchannelmixer=rr={rr}:bb={bb}")
     if cfg.saturation != 1.0:
         f.append(f"eq=saturation={cfg.saturation:.2f}")
     return f
@@ -406,6 +414,8 @@ def _post_upscale_filters(cfg: Config) -> list[str]:
         # Map common named ratios to SAR values; Real-ESRGAN outputs square pixels so we
         # just set the display AR via setdar without scaling (no quality loss).
         f.append(f"setdar={cfg.ar_target.replace(':', '/')}")
+    if cfg.cas:
+        f.append(f"cas=strength={cfg.cas_strength:.2f}")
     if cfg.sharpen:
         amt = cfg.sharpen_amount
         f.append(f"unsharp=lx=5:ly=5:la={amt:.1f}:cx=3:cy=3:ca=0.0")
@@ -1390,8 +1400,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
          "Color correction",   True,              "VHS 16–235 levels (always on)"),
         ("--balance-brightness",
          "Brightness balance",  nv >= 40,         "noisy sources often have exposure issues"),
+        ("--warmth 0.3",
+         "Color warmth",       False,             "opt-in — corrects cool/bluish VHS color cast"),
+        ("--cas",
+         "CAS sharpening",     False,             "opt-in — gentle contrast-adaptive sharpening"),
         ("--sharpen",
-         "Sharpness",          False,             "opt-in — adds crispness post-upscale"),
+         "Unsharp mask",       False,             "opt-in — stronger sharpening post-upscale"),
         ("--scale 2",
          "AI upscaling",       True,              "2× Real-ESRGAN (default)"),
         ("--fix-ar",
@@ -1541,6 +1555,8 @@ def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Auto-normalize brightness and contrast")
     g.add_argument("--sharpen", action="store_true",
                    help="Unsharp mask after upscaling")
+    g.add_argument("--cas", action="store_true",
+                   help="Contrast Adaptive Sharpening after upscaling (gentler than --sharpen)")
     g.add_argument("--fix-ar", action="store_true", dest="fix_ar",
                    help="Correct display aspect ratio (anamorphic / square-pixel mismatch)")
     g.add_argument("--audio-cleanup", action="store_true", dest="audio_cleanup",
@@ -1558,6 +1574,10 @@ def _restore_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
                    help="Color saturation multiplier (1.0=unchanged, 1.3=boost)")
     g.add_argument("--sharpen-amount", type=float, default=1.5, dest="sharpen_amount",
                    help="Unsharp mask strength (0.5–3.0)")
+    g.add_argument("--warmth", type=float, default=0.0,
+                   help="Color temperature: -1.0=cooler, 0=neutral, +1.0=warmer")
+    g.add_argument("--cas-strength", type=float, default=0.6, dest="cas_strength",
+                   help="Contrast Adaptive Sharpening strength (0.0–1.0)")
     g.add_argument("--ar-target", default="4:3", dest="ar_target",
                    help="Display aspect ratio for --fix-ar (e.g. 4:3, 16:9)")
     g.add_argument("--audio-cleanup-db", type=float, default=10.0, dest="audio_cleanup_db",
@@ -1628,6 +1648,176 @@ def cmd_restore(args: argparse.Namespace) -> None:
         return
 
     run_pipeline(input_path, output_path, cfg)
+
+
+# ── Enhance command ───────────────────────────────────────────────────────────
+
+def _build_enhance_filters(args: argparse.Namespace) -> list[str]:
+    """Build ffmpeg filter chain from enhance args. Order matches the full pipeline."""
+    f = []
+    if args.balance_brightness:
+        f.append("normalize=blackpt=black:whitept=white:smoothing=5")
+    if args.warmth != 0.0:
+        w = args.warmth * 0.15
+        rr = round(max(0.5, min(1.5, 1.0 + w)), 3)
+        bb = round(max(0.5, min(1.5, 1.0 - w)), 3)
+        f.append(f"colorchannelmixer=rr={rr}:bb={bb}")
+    if args.saturation != 1.0:
+        f.append(f"eq=saturation={args.saturation:.2f}")
+    if args.cas:
+        f.append(f"cas=strength={args.cas_strength:.2f}")
+    if args.sharpen:
+        f.append(f"unsharp=lx=5:ly=5:la={args.sharpen_amount:.1f}:cx=3:cy=3:ca=0.0")
+    return f
+
+
+def cmd_enhance(args: argparse.Namespace) -> None:
+    input_path  = args.input.resolve()
+    output_path = args.output.resolve()
+
+    if not input_path.exists():
+        _CONSOLE.print(f"[red]error:[/] file not found: {input_path}")
+        sys.exit(1)
+
+    filters = _build_enhance_filters(args)
+
+    if not filters:
+        _CONSOLE.print(
+            "[yellow]No effects selected — nothing to do.[/]\n"
+            "Pass at least one flag: --balance-brightness, --warmth, --saturation, --cas, --sharpen"
+        )
+        sys.exit(1)
+
+    applied = ", ".join(filter(None, [
+        "brightness" if args.balance_brightness else "",
+        f"warmth {args.warmth:+.1f}" if args.warmth != 0.0 else "",
+        f"saturation ×{args.saturation:.1f}" if args.saturation != 1.0 else "",
+        f"CAS {args.cas_strength:.1f}" if args.cas else "",
+        f"sharpen {args.sharpen_amount:.1f}" if args.sharpen else "",
+    ]))
+
+    if args.dry_run:
+        _CONSOLE.print()
+        _CONSOLE.print(Panel(
+            "\n".join(f"[cyan]{f}[/]" for f in filters),
+            title=f"[bold]Filter chain[/]  ({applied})",
+            border_style="blue",
+        ))
+        return
+
+    if args.output_codec == "h264":
+        vcodec = ["-c:v", "libx264", "-crf", str(args.output_crf),
+                  "-preset", "slow", "-pix_fmt", "yuv420p"]
+    elif args.output_codec == "h265":
+        vcodec = ["-c:v", "libx265", "-crf", str(args.output_crf),
+                  "-preset", "slow", "-pix_fmt", "yuv420p"]
+    elif args.output_codec == "ffv1":
+        vcodec = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv422p10le"]
+    else:
+        vcodec = ["-c:v", "prores_ks", "-profile:v", "hq", "-pix_fmt", "yuv422p10le"]
+
+    total = _probe_frame_count(input_path)
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        expand=False,
+        console=_CONSOLE,
+    )
+
+    with Live(
+        Panel(progress,
+              title=f"[bold blue]Enhance[/]  {input_path.name}",
+              subtitle=f"[dim]{applied}[/]",
+              border_style="blue"),
+        console=_CONSOLE,
+        refresh_per_second=8,
+    ) as live:
+
+        def _refresh():
+            live.update(Panel(
+                progress,
+                title=f"[bold blue]Enhance[/]  {input_path.name}",
+                subtitle=f"[dim]{applied}[/]",
+                border_style="blue",
+            ))
+
+        tid = progress.add_task(f"[cyan]Applying filters[/]", total=total or None)
+
+        def _on_progress(line: str) -> None:
+            if m := re.search(r"frame=\s*(\d+)", line):
+                progress.update(tid, completed=int(m.group(1)), total=total)
+                _refresh()
+
+        _run_tracking(
+            ["ffmpeg", "-y", "-i", str(input_path),
+             "-vf", ",".join(filters),
+             *vcodec, "-c:a", "copy", str(output_path)],
+            on_stderr=_on_progress,
+        )
+        progress.update(tid, completed=total or 1, total=total or 1,
+                        description="[green]Done[/]  ✓")
+        _refresh()
+
+    _CONSOLE.print()
+    _CONSOLE.print(Panel(
+        f"[green]✓[/]  {output_path}\n[dim]Applied: {applied}[/]",
+        border_style="green",
+    ))
+
+
+def _enhance_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    p = sub.add_parser(
+        "enhance",
+        help="Apply color and sharpness improvements (no VapourSynth required)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Each effect is opt-in. Combine freely.
+
+            examples:
+              %(prog)s restored.mkv out.mp4 --warmth 0.3 --saturation 1.3
+              %(prog)s restored.mkv out.mp4 --cas --balance-brightness
+              %(prog)s restored.mkv out.mp4 --warmth 0.4 --saturation 1.25 --cas --cas-strength 0.7
+              %(prog)s restored.mkv out.mp4 --sharpen --sharpen-amount 1.2
+              %(prog)s restored.mkv out.mp4 --dry-run --warmth 0.3 --cas
+        """),
+    )
+    p.add_argument("input",  type=Path, help="Source video file")
+    p.add_argument("output", type=Path, help="Output file")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print the filter chain without processing")
+
+    g = p.add_argument_group("Color")
+    g.add_argument("--balance-brightness", action="store_true", dest="balance_brightness",
+                   help="Auto-normalize brightness and contrast")
+    g.add_argument("--warmth", type=float, default=0.0,
+                   help="Color temperature: -1.0=cooler, 0=neutral, +1.0=warmer")
+    g.add_argument("--saturation", type=float, default=1.0,
+                   help="Saturation multiplier (1.0=unchanged, 1.3=boost)")
+
+    g = p.add_argument_group("Sharpness")
+    g.add_argument("--cas", action="store_true",
+                   help="Contrast Adaptive Sharpening (gentle, natural-looking)")
+    g.add_argument("--cas-strength", type=float, default=0.6, dest="cas_strength",
+                   help="CAS strength (0.0–1.0)")
+    g.add_argument("--sharpen", action="store_true",
+                   help="Unsharp mask (stronger than CAS)")
+    g.add_argument("--sharpen-amount", type=float, default=1.5, dest="sharpen_amount",
+                   help="Unsharp mask strength (0.5–3.0)")
+
+    g = p.add_argument_group("Output format")
+    g.add_argument("--codec", dest="output_codec", default="h264",
+                   choices=["ffv1", "prores", "h264", "h265"],
+                   help="Video codec")
+    g.add_argument("--crf", type=int, default=18, dest="output_crf",
+                   metavar="0-51",
+                   help="Quality for h264/h265")
+
+    return p
 
 
 # ── Trim command ──────────────────────────────────────────────────────────────
@@ -1765,6 +1955,7 @@ def main() -> None:
               analyze   Probe a video file and print recommended restore settings
               trim      Remove leading/trailing black screens from a capture
               restore   Run the full pipeline (deinterlace → denoise → upscale → grain)
+              enhance   Apply color/sharpness improvements independently (no VapourSynth)
 
             quick start:
               python pipeline/restore.py analyze capture.mp4
@@ -1772,6 +1963,7 @@ def main() -> None:
               python pipeline/restore.py restore capture.mp4 output.mkv
               python pipeline/restore.py restore capture.mp4 output.mp4 --profile streaming
               python pipeline/restore.py restore capture.mp4 out.mkv --test --test-sample
+              python pipeline/restore.py enhance restored.mkv out.mp4 --warmth 0.3 --saturation 1.3 --cas
         """),
     )
     p.add_argument("-v", "--verbose", action="store_true",
@@ -1811,6 +2003,9 @@ def main() -> None:
     # restore subcommand
     _restore_parser(sub)
 
+    # enhance subcommand
+    _enhance_parser(sub)
+
     args = p.parse_args()
 
     if args.subcommand is None:
@@ -1833,6 +2028,8 @@ def main() -> None:
         if getattr(args, "test_sample", False) and not getattr(args, "test_mode", False):
             args.test_mode = True
         cmd_restore(args)
+    elif args.subcommand == "enhance":
+        cmd_enhance(args)
 
 
 if __name__ == "__main__":
