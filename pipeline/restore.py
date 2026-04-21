@@ -488,12 +488,24 @@ def detect_field_order(path: Path) -> str:
 
 def _vs_plugins_available() -> bool:
     """Return True if ffms2 and knlm are both loaded in VapourSynth core."""
+    return not _vs_missing_plugins()
+
+
+def _vs_missing_plugins() -> list[str]:
+    """Return list of missing VapourSynth plugin names (empty = all OK)."""
     try:
         import vapoursynth as vs  # type: ignore
         core = vs.core
-        return hasattr(core, "ffms2") and hasattr(core, "knlm")
-    except Exception:
-        return False
+        missing = []
+        if not hasattr(core, "ffms2"):
+            missing.append("ffms2  (video source — libffms2.so)")
+        if not hasattr(core, "knlm"):
+            missing.append("KNLMeansCL  (GPU denoising — libKNLMeansCL.so)")
+        return missing
+    except ImportError:
+        return ["vapoursynth  (Python module not installed)"]
+    except Exception as e:
+        return [f"vapoursynth  (import error: {e})"]
 
 
 def _stage_vs_ffmpeg(
@@ -558,10 +570,18 @@ def stage_vs(
             return
         template = _VS_TEMPLATE_PROGRESSIVE
     else:
-        if not _vs_plugins_available():
+        missing = _vs_missing_plugins()
+        if missing:
+            plugin_dir = Path.home() / ".local/lib/vapoursynth"
+            installed  = sorted(p.name for p in plugin_dir.glob("*.so")) if plugin_dir.exists() else []
             raise RuntimeError(
-                "VapourSynth plugins (ffms2, KNLMeansCL) are required for interlaced sources. "
-                "Run bash pipeline/setup_ubuntu.sh to install them."
+                "VapourSynth plugin(s) not loaded:\n"
+                + "".join(f"  ✗  {m}\n" for m in missing)
+                + f"\nInstalled in {plugin_dir}:\n"
+                + (("\n".join(f"  {s}" for s in installed) or "  (none)") + "\n")
+                + "\nRun  bash pipeline/verify.sh  for full diagnosis.\n"
+                "If plugins are missing, re-run  bash pipeline/setup_ubuntu.sh  and check for\n"
+                "warnings in the [6/8] VapourSynth plugins step."
             )
         LOG.info("[Stage 1] Deinterlace + Denoise + Color correction (VapourSynth)")
         template = _VS_TEMPLATE_INTERLACED
