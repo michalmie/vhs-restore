@@ -207,6 +207,7 @@ if find "$VS_PLUGIN_DIR" -name "libffms2.so" 2>/dev/null | grep -qv "^$"; then
 else
     JFFMPEG="/usr/lib/jellyfin-ffmpeg"
     FFMS2_SRC="/tmp/vs-plugin-ffms2"
+    FFMS2_LOG="/tmp/vs-build-ffms2.log"
     echo "  Building ffms2 against jellyfin-ffmpeg7..."
     rm -rf "$FFMS2_SRC"
     if [ ! -d "$JFFMPEG" ]; then
@@ -220,22 +221,23 @@ else
         if [ -n "$JFFMPEG_PKG" ]; then
             export PKG_CONFIG_PATH="$JFFMPEG_PKG:$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
         fi
-        ./autogen.sh 2>/dev/null
+        ./autogen.sh > "$FFMS2_LOG" 2>&1
         # Pass jellyfin include/lib paths explicitly so configure finds ffmpeg regardless of pkg-config
         CPPFLAGS="-I${JFFMPEG}/include" \
         LDFLAGS="-L${JFFMPEG}/lib -Wl,-rpath,${JFFMPEG}/lib" \
-        ./configure --prefix=/usr/local --with-vapoursynth 2>/dev/null
-        if make -j"$(nproc)" 2>/dev/null; then
+        ./configure --prefix=/usr/local --with-vapoursynth >> "$FFMS2_LOG" 2>&1
+        if make -j"$(nproc)" >> "$FFMS2_LOG" 2>&1; then
             # autotools puts the VS plugin .so in src/vapoursynth/.libs/
             BUILT_SO=$(find . -name "libffms2.so" ! -name "*.la" 2>/dev/null | head -1)
             if [ -n "$BUILT_SO" ]; then
                 cp "$BUILT_SO" "$VS_PLUGIN_DIR/libffms2.so"
                 ok "ffms2 (built against jellyfin-ffmpeg7)"
             else
-                warn "ffms2: build succeeded but libffms2.so not found"
+                warn "ffms2: build succeeded but libffms2.so not found — check $FFMS2_LOG"
             fi
         else
-            warn "ffms2: make failed — video source unavailable"
+            warn "ffms2: build failed — last 20 lines of $FFMS2_LOG:"
+            tail -20 "$FFMS2_LOG" | sed 's/^/    /'
         fi
         cd - > /dev/null
     fi
@@ -245,6 +247,7 @@ fi
 _build_meson_plugin() {
     local name="$1" url="$2" so_pattern="$3"
     local src="/tmp/vs-plugin-$name"
+    local log="/tmp/vs-build-${name}.log"
     if find "$VS_PLUGIN_DIR" -name "$so_pattern" 2>/dev/null | grep -q .; then
         ok "$name (already installed)"; return 0
     fi
@@ -255,16 +258,17 @@ _build_meson_plugin() {
     fi
     cd "$src"
     if PKG_CONFIG_PATH="$VS_PKG${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
-       meson setup build --buildtype=release -Ddefault_library=shared 2>/dev/null \
-       && ninja -C build -j"$(nproc)" 2>/dev/null; then
+       meson setup build --buildtype=release -Ddefault_library=shared > "$log" 2>&1 \
+       && ninja -C build -j"$(nproc)" >> "$log" 2>&1; then
         find build -name "*.so" -exec cp {} "$VS_PLUGIN_DIR/" \;
         if find "$VS_PLUGIN_DIR" -name "$so_pattern" 2>/dev/null | grep -q .; then
             ok "$name (built from source)"
         else
-            warn "$name: built but $so_pattern not found in plugin dir"
+            warn "$name: built but $so_pattern not found in plugin dir — check $log"
         fi
     else
-        warn "$name: meson build failed"
+        warn "$name: build failed — last 20 lines of $log:"
+        tail -20 "$log" | sed 's/^/    /'
     fi
     cd - > /dev/null
 }

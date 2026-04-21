@@ -100,27 +100,34 @@ fi
 echo ""
 echo "VapourSynth"
 python3 - <<'EOF'
+import sys
 try:
     import vapoursynth as vs
     print(f"  \033[0;32m✓\033[0m vapoursynth: {vs.__version__}")
 except ImportError as e:
     print(f"  \033[0;31m✗\033[0m vapoursynth import failed: {e}")
-    exit(1)
+    sys.exit(1)
 
 core = vs.core
+any_missing = False
 
 plugins = {
-    "ffms2":      ("ffms2",    "Video source (core.ffms2.Source)"),
-    "knlmeanscl": ("knlm",     "GPU denoising (core.knlm.KNLMeansCL)"),
-    "mvtools":    ("mv",       "Motion compensation (needed by QTGMC)"),
+    "ffms2":      ("ffms2", "Video source (core.ffms2.Source)"),
+    "knlmeanscl": ("knlm",  "GPU denoising (core.knlm.KNLMeansCL)"),
+    "mvtools":    ("mv",    "Motion compensation (needed by QTGMC)"),
 }
 
 for plugin_id, (attr, desc) in plugins.items():
     if hasattr(core, attr):
         print(f"  \033[0;32m✓\033[0m {plugin_id}: loaded ({desc})")
     else:
-        print(f"  \033[0;31m✗\033[0m {plugin_id}: NOT loaded — check {attr}.so in plugin dir")
+        print(f"  \033[0;31m✗\033[0m {plugin_id}: NOT loaded — {attr}.so missing from plugin dir")
+        any_missing = True
+
+if any_missing:
+    sys.exit(1)
 EOF
+[ $? -ne 0 ] && FAILURES=$((FAILURES+1))
 
 # havsfunc / QTGMC
 python3 -c "import havsfunc; print('  \033[0;32m✓\033[0m havsfunc (QTGMC): imported')" 2>/dev/null || \
