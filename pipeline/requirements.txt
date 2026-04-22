@@ -3,6 +3,7 @@
 
 # TUI / display
 rich>=13.0.0
+textual>=0.60.0
 
 # Quality gate metrics (BRISQUE, NIQE)
 piq>=0.8.0

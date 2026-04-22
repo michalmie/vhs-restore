@@ -344,8 +344,8 @@ ok "Real-ESRGAN → $REALESRGAN_DIR"
 # ── 8. Pipeline Python dependencies ───────────────────────────────────────────
 step 8 "Pipeline Python packages"
 
-pip install piq rich -q
-ok "piq (quality metrics) + rich (TUI display)"
+pip install piq rich "textual>=0.60.0" -q
+ok "piq (quality metrics) + rich + textual (TUI)"
 
 
 # ── Final verification ────────────────────────────────────────────────────────
