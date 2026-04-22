@@ -821,12 +821,14 @@ class RunScreen(Screen):
     def compose(self) -> ComposeResult:
         s = self.app.state
         inp_name = s.input_path.name if s.input_path else "?"
-        out_name = (s.output_path or s.auto_output()).name
+        has_output = s.action != "analyze"
+        out_name   = (s.output_path or s.auto_output()).name if has_output else ""
+        arrow      = f"  →  [cyan]{out_name}[/]" if has_output else ""
 
         yield Header(show_clock=False)
         with Vertical():
             yield Static(
-                f"\n  [bold]{inp_name}[/]  →  [cyan]{out_name}[/]"
+                f"\n  [bold]{inp_name}[/]{arrow}"
                 f"  ·  [dim]{s.action}[/]\n",
                 id="run-header",
             )
@@ -849,11 +851,12 @@ class RunScreen(Screen):
         log.write(f"[dim]$ {' '.join(cmd)}\n[/]")
 
         try:
+            # Run without FORCE_COLOR — Rich detects the pipe and uses plain
+            # line-by-line output (no cursor-movement codes that cause duplicates).
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "FORCE_COLOR": "1"},
             )
             assert self._proc.stdout is not None
             async for raw in self._proc.stdout:
