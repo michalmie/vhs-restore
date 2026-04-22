@@ -912,32 +912,38 @@ class VHSTui(App[None]):
         background: #21262d;
         color: #79c0ff;
         text-style: bold;
-        padding: 0 1;
+        padding: 0 2;
         margin-top: 1;
         width: 100%;
-        height: 1;
+        height: 3;
+        content-align: left middle;
     }
     .row {
         height: 3;
-        align: left middle;
         padding: 0 2;
     }
     .lbl {
-        width: 32;
+        width: 34;
+        height: 3;
+        content-align: left middle;
         color: #c9d1d9;
+        padding: 0 1;
     }
     .hint {
+        height: 3;
+        content-align: left middle;
         color: #484f58;
-        margin-left: 1;
+        padding: 0 1;
     }
     .narrow {
         width: 10;
     }
     .wide-input {
-        width: 60;
+        width: 1fr;
     }
     Input {
-        width: 32;
+        width: 24;
+        height: 3;
         background: #161b22;
         border: tall #30363d;
         color: #c9d1d9;
@@ -946,12 +952,15 @@ class VHSTui(App[None]):
         border: tall #388bfd;
     }
     Select {
-        width: 40;
+        width: 42;
+        height: 3;
         background: #161b22;
         border: tall #30363d;
     }
     Switch {
+        height: 3;
         background: transparent;
+        margin: 0 1;
     }
     #action-layout {
         height: 1fr;
